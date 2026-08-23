@@ -1,5 +1,6 @@
 # Reasonix 会话元数据（本机）
 .reasonix/
+reasonix.toml
 
 # Local NAS/Wi-Fi settings; never commit credentials or LAN addresses.
 include/local_config.h

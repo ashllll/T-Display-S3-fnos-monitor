@@ -7,10 +7,7 @@
 #if __has_include("local_config.h")
 #include "local_config.h"
 #else
-#define FNOS_DEMO_MODE 1
-#define FNOS_HOST ""
-#define FNOS_API_PATH "/metrics"
-#define FNOS_API_TOKEN ""
+#error "Create include/local_config.h from include/local_config.example.h before building"
 #endif
 
 #ifndef FNOS_REDUCED_MOTION
@@ -23,10 +20,16 @@ constexpr int16_t SCREEN_W = 170;
 constexpr int16_t SCREEN_H = 320;
 constexpr uint8_t PAGE_COUNT = 7;
 constexpr uint8_t HISTORY_COUNT = 14;
-constexpr uint32_t REFRESH_MS = 5000;
+constexpr uint32_t REFRESH_MS = 1000;
+constexpr uint16_t HISTORY_WINDOW_SECONDS = HISTORY_COUNT * REFRESH_MS / 1000;
 constexpr uint32_t FRAME_INTERVAL_US = 16667;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 18;
-constexpr float SPRING_RESPONSE = 0.40f;
+constexpr uint8_t BACKLIGHT_PERCENT = 50;
+constexpr uint8_t BACKLIGHT_PWM_CHANNEL = 7;
+constexpr uint8_t BACKLIGHT_PWM_BITS = 8;
+constexpr uint16_t BACKLIGHT_PWM_HZ = 12000;
+constexpr uint16_t BACKLIGHT_FADE_MS = 120;
+constexpr float SPRING_RESPONSE = 0.28f;
 constexpr float SPRING_OMEGA = 2.0f * PI / SPRING_RESPONSE;
 
 enum class Page : uint8_t { Overview, Network, Storage, System, Normal, HighLoad, Timeout };
@@ -38,17 +41,13 @@ struct Palette {
 
 struct NasState {
   bool online = false;
-  bool demo = true;
   int cpu = -1;
   int memory = -1;
-  int ping_ms = -1;
-  int clients = -1;
+  int gpu = -1;
+  int api_rtt_ms = -1;
   int cpu_temp_c = -1;
   int disk_temp_c = -1;
   int lan_speed_mbps = -1;
-  int docker_running = -1;
-  int docker_total = -1;
-  int packet_loss = -1;
   float used_tb = NAN;
   float total_tb = NAN;
   float memory_used_gb = NAN;
@@ -77,8 +76,16 @@ TFT_eSprite frame_a(&tft);
 TFT_eSprite frame_b(&tft);
 Palette color;
 NasState state;
+NasState collector_state;
+NasState pending_state;
 DebouncedButton previous_button{BUTTON_1};
 DebouncedButton next_button{BUTTON_2};
+
+SemaphoreHandle_t telemetry_mutex = nullptr;
+TaskHandle_t telemetry_task = nullptr;
+volatile bool telemetry_ready = false;
+
+void announceTelemetry();
 
 bool frame_a_ready = false;
 bool frame_b_ready = false;
@@ -87,20 +94,18 @@ int cached_b_page = -1000;
 float page_position = 0.0f;
 float page_target = 0.0f;
 float page_velocity = 0.0f;
-uint32_t last_refresh = 0;
 uint32_t last_frame_us = 0;
 bool screen_dirty = true;
+bool telemetry_redraw_pending = false;
 
 float down_history[HISTORY_COUNT]{};
 float up_history[HISTORY_COUNT]{};
-float ping_history[HISTORY_COUNT]{};
+float latency_history[HISTORY_COUNT]{};
 float cpu_history[HISTORY_COUNT]{};
 float temp_history[HISTORY_COUNT]{};
 
 const char *const PAGE_NAMES[PAGE_COUNT] = {
     "OVERVIEW", "NETWORK", "STORAGE", "SYSTEM", "NORMAL", "HIGH LOAD", "TIMEOUT"};
-const uint8_t HIGH_LOAD_CURVE[HISTORY_COUNT] = {
-    12, 24, 48, 34, 70, 55, 88, 68, 96, 78, 100, 80, 94, 86};
 const uint8_t TIMEOUT_CURVE[HISTORY_COUNT] = {
     42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42};
 
@@ -109,7 +114,7 @@ int pageModulo(int value) {
   return result < 0 ? result + PAGE_COUNT : result;
 }
 
-bool realtimeValid() { return state.demo || state.online; }
+bool realtimeValid() { return state.online; }
 
 int storagePercent() {
   if (!isfinite(state.used_tb) || !isfinite(state.total_tb) || state.total_tb <= 0.0f) return -1;
@@ -154,6 +159,27 @@ void drawLabel(TFT_eSprite &canvas, const String &text, int16_t x, int16_t y,
   canvas.drawString(text, x, y, font);
 }
 
+String fitLabel(TFT_eSprite &canvas, const String &text, uint8_t font, int16_t max_width) {
+  if (max_width <= 0) return "";
+  if (canvas.textWidth(text, font) <= max_width) return text;
+  for (int length = text.length() - 1; length > 0; --length) {
+    const String candidate = text.substring(0, length) + ".";
+    if (canvas.textWidth(candidate, font) <= max_width) return candidate;
+  }
+  return "";
+}
+
+void drawEdgePair(TFT_eSprite &canvas, const String &left, const String &right, int16_t y,
+                  uint16_t left_color, uint16_t right_color) {
+  constexpr int16_t edge = 8;
+  constexpr int16_t gap = 8;
+  const int16_t right_width = min<int16_t>(canvas.textWidth(right, 1), SCREEN_W - edge * 2);
+  const int16_t left_width = SCREEN_W - edge * 2 - gap - right_width;
+  drawLabel(canvas, fitLabel(canvas, left, 1, left_width), edge, y, 1, left_color);
+  drawLabel(canvas, fitLabel(canvas, right, 1, SCREEN_W - edge * 2),
+            SCREEN_W - edge, y, 1, right_color, TR_DATUM);
+}
+
 void drawTemperature(TFT_eSprite &canvas, int value, int16_t x, int16_t y,
                      uint8_t font, uint16_t text_color, uint8_t datum = TL_DATUM) {
   const String number = intValue(value);
@@ -175,8 +201,8 @@ void drawTemperature(TFT_eSprite &canvas, int value, int16_t x, int16_t y,
 void drawFitNumber(TFT_eSprite &canvas, const String &text, int16_t x, int16_t y,
                    int16_t max_width, int16_t max_height, uint16_t text_color,
                    uint8_t datum = TL_DATUM) {
-  const uint8_t fonts[] = {6, 4, 2};
-  uint8_t selected = 2;
+  const uint8_t fonts[] = {6, 4, 2, 1};
+  uint8_t selected = 1;
   for (uint8_t font : fonts) {
     if (canvas.textWidth(text, font) <= max_width && canvas.fontHeight(font) <= max_height) {
       selected = font;
@@ -188,8 +214,10 @@ void drawFitNumber(TFT_eSprite &canvas, const String &text, int16_t x, int16_t y
 
 void drawHeader(TFT_eSprite &canvas, const String &title, const String &status,
                 uint16_t status_color) {
-  drawLabel(canvas, title, 8, 6, 2, color.text);
-  drawLabel(canvas, status, 162, 9, 1, status_color, TR_DATUM);
+  const String fitted_status = fitLabel(canvas, status, 1, 82);
+  const int16_t title_width = 146 - canvas.textWidth(fitted_status, 1);
+  drawLabel(canvas, fitLabel(canvas, title, 2, title_width), 8, 6, 2, color.text);
+  drawLabel(canvas, fitted_status, 162, 9, 1, status_color, TR_DATUM);
 }
 
 void drawFooter(TFT_eSprite &canvas, Page page) {
@@ -319,31 +347,12 @@ void drawHistoryCurve(TFT_eSprite &canvas, int16_t x, int16_t y, int16_t width,
 }
 
 void seedHistories() {
-  const float down_pattern[HISTORY_COUNT] = {
-      .66f, .74f, .68f, .86f, .72f, .96f, .78f, 1.02f, .82f, .98f, .76f, .91f, .84f, 1.04f};
-  const float up_pattern[HISTORY_COUNT] = {
-      .82f, .87f, .79f, .94f, .84f, 1.02f, .86f, 1.08f, .88f, 1.03f, .90f, 1.00f, .94f, .91f};
-  const float ping_pattern[HISTORY_COUNT] = {
-      .88f, .96f, .83f, 1.14f, .91f, 1.22f, .95f, 1.28f, .98f, 1.18f, .90f, 1.11f, .94f, 1.04f};
-  const float down = isfinite(state.down_mbps) ? max(1.0f, state.down_mbps) : 128.6f;
-  const float up = isfinite(state.up_mbps) ? max(.2f, state.up_mbps) : 12.4f;
-  const float ping = state.ping_ms >= 0 ? state.ping_ms : 24.0f;
-  const float cpu = state.cpu >= 0 ? state.cpu : 12.0f;
-  const float temp = state.disk_temp_c >= 0 ? state.disk_temp_c : 36.0f;
   for (uint8_t index = 0; index < HISTORY_COUNT; ++index) {
-    if (state.demo) {
-      down_history[index] = down * down_pattern[index];
-      up_history[index] = up * up_pattern[index];
-      ping_history[index] = ping * ping_pattern[index];
-      cpu_history[index] = cpu * (.76f + (index % 5) * .08f);
-      temp_history[index] = temp + (static_cast<int>(index % 5) - 2) * .55f;
-    } else {
-      down_history[index] = isfinite(state.down_mbps) ? state.down_mbps : NAN;
-      up_history[index] = isfinite(state.up_mbps) ? state.up_mbps : NAN;
-      ping_history[index] = state.ping_ms >= 0 ? state.ping_ms : NAN;
-      cpu_history[index] = state.cpu >= 0 ? state.cpu : NAN;
-      temp_history[index] = state.disk_temp_c >= 0 ? state.disk_temp_c : NAN;
-    }
+    down_history[index] = isfinite(state.down_mbps) ? state.down_mbps : NAN;
+    up_history[index] = isfinite(state.up_mbps) ? state.up_mbps : NAN;
+    latency_history[index] = state.api_rtt_ms >= 0 ? state.api_rtt_ms : NAN;
+    cpu_history[index] = state.cpu >= 0 ? state.cpu : NAN;
+    temp_history[index] = state.disk_temp_c >= 0 ? state.disk_temp_c : NAN;
   }
 }
 
@@ -357,14 +366,14 @@ void appendCurrentStateToHistory() {
   if (!realtimeValid()) return;
   appendHistory(down_history, state.down_mbps);
   appendHistory(up_history, state.up_mbps);
-  appendHistory(ping_history, state.ping_ms >= 0 ? state.ping_ms : NAN);
+  appendHistory(latency_history, state.api_rtt_ms >= 0 ? state.api_rtt_ms : NAN);
   appendHistory(cpu_history, state.cpu >= 0 ? state.cpu : NAN);
   appendHistory(temp_history, state.disk_temp_c >= 0 ? state.disk_temp_c : NAN);
 }
 
 void drawOverview(TFT_eSprite &canvas) {
-  const String status = state.demo ? "DEMO ONLINE" : (state.online ? "ONLINE" : "TIMEOUT");
-  drawHeader(canvas, "FNOS", status, state.online || state.demo ? color.green : color.red);
+  const String status = state.online ? "ONLINE" : "TIMEOUT";
+  drawHeader(canvas, "FNOS", status, state.online ? color.green : color.red);
   drawLabel(canvas, "DOWNLOAD", 8, 30, 1, color.cyan);
   drawFitNumber(canvas, floatValue(state.down_mbps), 7, 42, 138, 48, color.text);
   drawLabel(canvas, "Mb/s", 162, 68, 1, color.dim, TR_DATUM);
@@ -372,23 +381,24 @@ void drawOverview(TFT_eSprite &canvas) {
   drawFitNumber(canvas, floatValue(state.up_mbps), 8, 105, 105, 26, color.text);
   drawLabel(canvas, "Mb/s", 162, 113, 1, color.dim, TR_DATUM);
   canvas.fillRoundRect(8, 135, 154, 67, 7, color.panel);
-  drawLabel(canvas, "60S LIVE", 15, 142, 1, color.dim);
+  drawLabel(canvas, String(HISTORY_WINDOW_SECONDS) + "S LIVE", 15, 142, 1, color.dim);
   const float network_scale = sharedNetworkScale();
   drawHistoryCurve(canvas, 14, 154, 142, 41, down_history, color.cyan, 2, true, 0.0f, network_scale);
   drawHistoryCurve(canvas, 14, 169, 142, 25, up_history, color.green, 1, false, 0.0f, network_scale);
-  drawMetricTile(canvas, 8, 213, 46, "PING",
-                 state.ping_ms >= 0 ? String(state.ping_ms) + "ms" : "--ms", color.orange);
-  drawMetricTile(canvas, 62, 213, 46, "CLIENTS", intValue(state.clients));
+  drawMetricTile(canvas, 8, 213, 46, "API RT",
+                 state.api_rtt_ms >= 0 ? String(state.api_rtt_ms) + "ms" : "--ms", color.orange);
+  drawMetricTile(canvas, 62, 213, 46, "MEM", percentValue(state.memory));
   drawMetricTile(canvas, 116, 213, 46, "DISK", percentValue(storagePercent()), color.amber);
   drawLabel(canvas, "CPU " + percentValue(state.cpu), 8, 263, 1, color.dim);
-  drawLabel(canvas, "MEM " + percentValue(state.memory), 67, 263, 1, color.dim);
+  drawLabel(canvas, "TEMP", 62, 263, 1, color.dim);
+  drawTemperature(canvas, state.cpu_temp_c, 120, 263, 1, color.dim, TR_DATUM);
   drawLabel(canvas, uptimeValue(), 162, 263, 1, color.dim, TR_DATUM);
   drawFooter(canvas, Page::Overview);
 }
 
 void drawNetwork(TFT_eSprite &canvas) {
-  drawHeader(canvas, "NETWORK", state.demo ? "DEMO HEALTHY" : (state.online ? "HEALTHY" : "OFFLINE"),
-             state.online || state.demo ? color.green : color.red);
+  drawHeader(canvas, "NETWORK", state.online ? "HEALTHY" : "OFFLINE",
+             state.online ? color.green : color.red);
   canvas.fillRoundRect(8, 29, 154, 43, 8, color.panel);
   canvas.fillCircle(22, 50, 7, dimColor(color.cyan, 28));
   canvas.drawCircle(22, 50, 7, color.cyan);
@@ -402,41 +412,45 @@ void drawNetwork(TFT_eSprite &canvas) {
   canvas.fillTriangle(126, 50, 120, 46, 120, 54, color.green);
   canvas.fillCircle(142, 50, 7, dimColor(color.green, 25));
   canvas.drawCircle(142, 50, 7, color.green);
-  drawLabel(canvas, state.clients >= 0 ? String(state.clients) : "--", 142, 50, 1, color.green, MC_DATUM);
+  drawLabel(canvas, "L", 142, 50, 1, color.green, MC_DATUM);
   drawLabel(canvas, "WAN DOWN", 8, 83, 1, color.cyan);
   drawFitNumber(canvas, floatValue(state.down_mbps), 162, 78, 105, 26, color.text, TR_DATUM);
   drawLabel(canvas, "WAN UP", 8, 111, 1, color.green);
   drawFitNumber(canvas, floatValue(state.up_mbps), 162, 106, 105, 26, color.text, TR_DATUM);
   canvas.fillRoundRect(8, 139, 154, 61, 7, color.panel);
-  drawLabel(canvas, "PING 60S  " + intValue(state.ping_ms) + "ms", 15, 146, 1, color.dim);
-  drawHistoryCurve(canvas, 15, 159, 140, 34, ping_history, color.orange, 2, false, 0.0f, 150.0f);
+  drawLabel(canvas, "API RTT " + String(HISTORY_WINDOW_SECONDS) + "S  " +
+                        intValue(state.api_rtt_ms) + "ms", 15, 146, 1, color.dim);
+  drawHistoryCurve(canvas, 15, 159, 140, 34, latency_history, color.orange, 2, false, 0.0f, 1500.0f);
   String lan_value = "-- LINK";
   if (state.lan_speed_mbps >= 1000) lan_value = String(state.lan_speed_mbps / 1000) + "G LINK";
   else if (state.lan_speed_mbps > 0) lan_value = String(state.lan_speed_mbps) + "M LINK";
   else if (state.online) lan_value = "LINK UP";
   drawMetricTile(canvas, 8, 211, 73, "LAN", lan_value);
-  const String wifi_value = state.online ? String(WiFi.RSSI()) + "dBm" : (state.demo ? "-48dBm" : "--dBm");
+  const String wifi_value = state.online ? String(WiFi.RSSI()) + "dBm" : "--dBm";
   drawMetricTile(canvas, 89, 211, 73, "WIFI", wifi_value);
-  drawLabel(canvas, FNOS_HOST[0] ? String(FNOS_HOST) : String("192.168.9.23"), 8, 266, 1, color.dim);
-  drawLabel(canvas, state.packet_loss >= 0 ? String(state.packet_loss) + "% LOSS" : "--% LOSS",
-            162, 266, 1, state.packet_loss == 0 ? color.green : color.orange, TR_DATUM);
+  drawEdgePair(canvas, FNOS_HOST[0] ? String(FNOS_HOST) : String("192.168.9.23"),
+               state.online ? "DATA LIVE" : "NO DATA", 266, color.dim,
+               state.online ? color.green : color.red);
   drawFooter(canvas, Page::Network);
 }
 
 void drawStorage(TFT_eSprite &canvas) {
   const int used = storagePercent();
-  drawHeader(canvas, "STORAGE", state.demo ? "DEMO PASS" : (state.online ? "ONLINE" : "OFFLINE"),
-             state.online || state.demo ? color.green : color.red);
+  drawHeader(canvas, "STORAGE", state.online ? "ONLINE" : "OFFLINE",
+             state.online ? color.green : color.red);
   canvas.drawArc(69, 76, 46, 36, 30, 330, color.guide, color.background, true);
   if (used > 0) canvas.drawArc(69, 76, 46, 36, 30, 30 + used * 3, color.amber, color.background, true);
   drawLabel(canvas, percentValue(used), 69, 73, 4, color.text, MC_DATUM);
   drawLabel(canvas, "USED", 69, 101, 1, color.dim, MC_DATUM);
   drawLabel(canvas, "TOTAL", 122, 48, 1, color.dim);
-  drawLabel(canvas, isfinite(state.total_tb) && state.total_tb > 0 ? String(state.total_tb, 1) + "T" : "--.-T", 122, 60, 2, color.text);
+  drawFitNumber(canvas,
+                isfinite(state.total_tb) && state.total_tb > 0 ? String(state.total_tb, 1) + "T" : "--.-T",
+                122, 60, 40, 18, color.text);
   drawLabel(canvas, "FREE", 122, 87, 1, color.dim);
   const float free_tb = isfinite(state.total_tb) && isfinite(state.used_tb)
                             ? max(0.0f, state.total_tb - state.used_tb) : NAN;
-  drawLabel(canvas, isfinite(free_tb) ? String(free_tb, 1) + "T" : "--.-T", 122, 99, 2, color.text);
+  drawFitNumber(canvas, isfinite(free_tb) ? String(free_tb, 1) + "T" : "--.-T",
+                122, 99, 40, 18, color.text);
   canvas.fillRoundRect(8, 133, 154, 70, 7, color.panel);
   drawLabel(canvas, "CAPACITY", 15, 140, 1, color.dim);
   drawLabel(canvas, "POOL", 15, 158, 1, color.text);
@@ -453,15 +467,15 @@ void drawStorage(TFT_eSprite &canvas) {
   const String raid_value = state.raid_status.length() ? "RAID " + state.raid_status : "RAID UNKNOWN";
   const uint16_t raid_color = state.raid_status == "HEALTHY" ? color.green
                               : state.raid_status.length() ? color.orange : color.dim;
-  drawLabel(canvas, raid_value, 8, 275, 1, raid_color);
-  drawLabel(canvas, isfinite(state.disk_read_mb_s) ? "R " + String(state.disk_read_mb_s, 1) + "MB/s" : "R --MB/s",
-            162, 275, 1, color.blue, TR_DATUM);
+  drawEdgePair(canvas, raid_value,
+               isfinite(state.disk_read_mb_s) ? "R " + String(state.disk_read_mb_s, 1) + "MB/s" : "R --MB/s",
+               275, raid_color, color.blue);
   drawFooter(canvas, Page::Storage);
 }
 
 void drawSystem(TFT_eSprite &canvas) {
-  drawHeader(canvas, "SYSTEM", state.demo ? "DEMO STABLE" : (state.online ? "STABLE" : "OFFLINE"),
-             state.online || state.demo ? color.green : color.red);
+  drawHeader(canvas, "SYSTEM", state.online ? "STABLE" : "OFFLINE",
+             state.online ? color.green : color.red);
   canvas.fillRoundRect(8, 31, 73, 74, 8, color.panel);
   drawLabel(canvas, "CPU", 16, 39, 1, color.blue);
   drawFitNumber(canvas, percentValue(state.cpu), 16, 53, 61, 32, color.text);
@@ -474,57 +488,55 @@ void drawSystem(TFT_eSprite &canvas) {
   drawLabel(canvas, isfinite(state.memory_used_gb) ? String(state.memory_used_gb, 1) + "G" : "--.-G",
             97, 90, 1, color.dim);
   canvas.fillRoundRect(8, 116, 154, 63, 7, color.panel);
-  drawLabel(canvas, "CPU LOAD 60S", 15, 123, 1, color.dim);
+  drawLabel(canvas, "CPU LOAD " + String(HISTORY_WINDOW_SECONDS) + "S", 15, 123, 1, color.dim);
   drawHistoryCurve(canvas, 15, 137, 140, 35, cpu_history, color.blue, 2, false, 0.0f, 100.0f);
-  drawLabel(canvas, "DOCKER", 8, 194, 1, color.dim);
-  const String docker = state.docker_running >= 0 && state.docker_total >= 0
-                            ? String(state.docker_running) + "/" + String(state.docker_total) : String("--/--");
-  drawLabel(canvas, docker, 162, 189, 2, color.text, TR_DATUM);
+  drawLabel(canvas, "GPU", 8, 194, 1, color.dim);
+  drawLabel(canvas, percentValue(state.gpu), 162, 189, 2, color.text, TR_DATUM);
   canvas.fillRoundRect(8, 218, 154, 35, 7, color.panel_alt);
-  canvas.fillCircle(18, 235, 4, color.green);
-  drawLabel(canvas, intValue(state.docker_running) + " RUNNING", 28, 228, 1, color.text);
-  const int stopped = state.docker_running >= 0 && state.docker_total >= 0
-                          ? max(0, state.docker_total - state.docker_running) : -1;
-  canvas.fillCircle(111, 235, 4, color.orange);
-  drawLabel(canvas, intValue(stopped) + " STOP", 121, 228, 1, color.text);
-  drawLabel(canvas, "UPTIME " + uptimeValue(), 8, 268, 1, color.dim);
-  drawLabel(canvas, isfinite(state.load_1m) ? "LOAD " + String(state.load_1m, 2) : "LOAD --",
-            162, 268, 1, color.dim, TR_DATUM);
+  const bool storage_healthy = state.raid_status == "HEALTHY";
+  canvas.fillCircle(18, 235, 4, storage_healthy ? color.green : color.orange);
+  drawLabel(canvas, state.raid_status.length() ? state.raid_status : "NO DATA", 28, 228, 1,
+            storage_healthy ? color.text : color.orange);
+  drawTemperature(canvas, state.disk_temp_c, 153, 228, 1,
+                  state.disk_temp_c >= 0 ? color.text : color.dim, TR_DATUM);
+  drawEdgePair(canvas, "UPTIME " + uptimeValue(),
+               isfinite(state.load_1m) ? "LOAD " + String(state.load_1m, 2) : "LOAD --",
+               268, color.dim, color.dim);
   drawFooter(canvas, Page::System);
 }
 
 void drawNormal(TFT_eSprite &canvas) {
-  drawHeader(canvas, "STATE", state.demo ? "DEMO NORMAL" : (state.online ? "NORMAL" : "OFFLINE"),
-             state.online || state.demo ? color.green : color.red);
+  drawHeader(canvas, "STATE", state.online ? "NORMAL" : "OFFLINE",
+             state.online ? color.green : color.red);
   canvas.fillRoundRect(8, 29, 154, 32, 8, dimColor(color.green, 18));
   canvas.fillCircle(20, 45, 4, color.green);
-  drawLabel(canvas, state.online || state.demo ? "ONLINE HEALTHY" : "LINK LOST",
-            30, 38, 2, state.online || state.demo ? color.green : color.red);
+  drawLabel(canvas, state.online ? "ONLINE HEALTHY" : "LINK LOST",
+            30, 38, 2, state.online ? color.green : color.red);
   drawLabel(canvas, "DOWNLOAD", 8, 74, 1, color.cyan);
   drawFitNumber(canvas, floatValue(state.down_mbps), 8, 84, 138, 48, color.text);
   drawLabel(canvas, "Mb/s", 162, 111, 1, color.dim, TR_DATUM);
   canvas.fillRoundRect(8, 133, 154, 63, 7, color.panel);
-  drawLabel(canvas, "NETWORK 60S", 15, 140, 1, color.dim);
+  drawLabel(canvas, "NETWORK " + String(HISTORY_WINDOW_SECONDS) + "S", 15, 140, 1, color.dim);
   drawHistoryCurve(canvas, 15, 153, 140, 37, down_history, color.cyan, 2, true);
-  drawMetricTile(canvas, 8, 207, 46, "PING",
-                 state.ping_ms >= 0 ? String(state.ping_ms) + "ms" : "--ms", color.orange);
+  drawMetricTile(canvas, 8, 207, 46, "API RT",
+                 state.api_rtt_ms >= 0 ? String(state.api_rtt_ms) + "ms" : "--ms", color.orange);
   drawMetricTile(canvas, 62, 207, 46, "CPU", percentValue(state.cpu));
   drawMetricTile(canvas, 116, 207, 46, "DISK", percentValue(storagePercent()), color.amber);
-  drawLabel(canvas, state.online || state.demo ? "ALL SERVICES READY" : "SERVICES UNKNOWN",
-            8, 266, 1, state.online || state.demo ? color.green : color.red);
-  drawLabel(canvas, state.packet_loss >= 0 ? String(state.packet_loss) + "% LOSS" : "--% LOSS",
-            162, 266, 1, color.dim, TR_DATUM);
+  drawEdgePair(canvas, state.online ? "SERVICES READY" : "SERVICES UNKNOWN",
+               state.api_rtt_ms >= 0 ? "API " + String(state.api_rtt_ms) + "ms" : "API NO DATA",
+               266, state.online ? color.green : color.red,
+               state.api_rtt_ms >= 0 ? color.green : color.dim);
   drawFooter(canvas, Page::Normal);
 }
 
 void drawHighLoad(TFT_eSprite &canvas) {
-  const float down = state.demo ? 842.7f : state.down_mbps;
-  const float up = state.demo ? 96.8f : state.up_mbps;
-  const int cpu = state.demo ? 82 : state.cpu;
-  const int ping = state.demo ? 68 : state.ping_ms;
-  const int disk = state.demo ? 87 : storagePercent();
-  const bool high = state.demo || cpu >= 80 || disk >= 85 || (isfinite(down) && down >= 800.0f);
-  drawHeader(canvas, "STATE", state.demo ? "DEMO HIGH LOAD" : (high ? "HIGH LOAD" : "LOAD WATCH"),
+  const float down = state.down_mbps;
+  const float up = state.up_mbps;
+  const int cpu = state.cpu;
+  const int api_rtt = state.api_rtt_ms;
+  const int disk = storagePercent();
+  const bool high = cpu >= 80 || disk >= 85 || (isfinite(down) && down >= 800.0f);
+  drawHeader(canvas, "STATE", high ? "HIGH LOAD" : "LOAD WATCH",
              high ? color.amber : color.green);
   canvas.fillRoundRect(8, 29, 154, 32, 8, dimColor(high ? color.amber : color.green, 16));
   canvas.fillCircle(20, 45, 4, high ? color.amber : color.green);
@@ -533,25 +545,22 @@ void drawHighLoad(TFT_eSprite &canvas) {
   drawFitNumber(canvas, floatValue(down), 8, 84, 138, 48, color.text);
   drawLabel(canvas, "Mb/s", 162, 111, 1, color.dim, TR_DATUM);
   canvas.fillRoundRect(8, 133, 154, 63, 7, color.panel);
-  drawLabel(canvas, high ? "TRAFFIC PEAK 60S" : "TRAFFIC WATCH 60S", 15, 140, 1,
+  drawLabel(canvas, String(high ? "TRAFFIC PEAK " : "TRAFFIC WATCH ") +
+                        HISTORY_WINDOW_SECONDS + "S", 15, 140, 1,
             high ? color.amber : color.dim);
-  if (state.demo) {
-    drawSmoothCurve(canvas, 15, 153, 140, 37, HIGH_LOAD_CURVE, HISTORY_COUNT, color.cyan, 2, true);
-  } else {
-    drawHistoryCurve(canvas, 15, 153, 140, 37, down_history, color.cyan, 2, true);
-  }
-  drawMetricTile(canvas, 8, 207, 46, "PING", ping >= 0 ? String(ping) + "ms" : "--ms", color.orange);
+  drawHistoryCurve(canvas, 15, 153, 140, 37, down_history, color.cyan, 2, true);
+  drawMetricTile(canvas, 8, 207, 46, "API RT",
+                 api_rtt >= 0 ? String(api_rtt) + "ms" : "--ms", color.orange);
   drawMetricTile(canvas, 62, 207, 46, "CPU", percentValue(cpu), high ? color.amber : color.text);
   drawMetricTile(canvas, 116, 207, 46, "DISK", percentValue(disk), high ? color.amber : color.text);
-  drawLabel(canvas, high ? "THROTTLE WATCH" : "CAPACITY READY", 8, 266, 1,
-            high ? color.amber : color.green);
-  drawLabel(canvas, floatValue(up) + " UP", 162, 266, 1, color.orange, TR_DATUM);
+  drawEdgePair(canvas, high ? "THROTTLE WATCH" : "CAPACITY READY",
+               floatValue(up) + " UP", 266, high ? color.amber : color.green, color.orange);
   drawFooter(canvas, Page::HighLoad);
 }
 
 void drawTimeout(TFT_eSprite &canvas) {
-  const bool timeout = state.demo || !state.online;
-  drawHeader(canvas, "STATE", state.demo ? "DEMO TIMEOUT" : (timeout ? "TIMEOUT" : "ONLINE"),
+  const bool timeout = !state.online;
+  drawHeader(canvas, "STATE", timeout ? "TIMEOUT" : "ONLINE",
              timeout ? color.red : color.green);
   canvas.fillRoundRect(8, 29, 154, 32, 8, dimColor(timeout ? color.red : color.green, 16));
   canvas.fillCircle(20, 45, 4, timeout ? color.red : color.green);
@@ -562,7 +571,8 @@ void drawTimeout(TFT_eSprite &canvas) {
                 timeout ? color.dim : color.text);
   drawLabel(canvas, "Mb/s", 162, 111, 1, color.idle, TR_DATUM);
   canvas.fillRoundRect(8, 133, 154, 63, 7, color.panel);
-  drawLabel(canvas, timeout ? "NO REALTIME DATA" : "NETWORK 60S", 15, 140, 1,
+  drawLabel(canvas, timeout ? String("NO REALTIME DATA")
+                            : "NETWORK " + String(HISTORY_WINDOW_SECONDS) + "S", 15, 140, 1,
             timeout ? color.red : color.dim);
   if (timeout) {
     drawSmoothCurve(canvas, 15, 153, 140, 37, TIMEOUT_CURVE, HISTORY_COUNT,
@@ -572,11 +582,11 @@ void drawTimeout(TFT_eSprite &canvas) {
   }
   drawMetricTile(canvas, 8, 207, 73, "LAST GOOD",
                  state.last_good_ms ? String((millis() - state.last_good_ms) / 1000) + "s ago" : "--");
-  drawMetricTile(canvas, 89, 207, 73, "NEXT RETRY", timeout ? "5s" : "READY",
+  drawMetricTile(canvas, 89, 207, 73, "NEXT RETRY", timeout ? "1s" : "READY",
                  timeout ? color.red : color.green);
-  drawLabel(canvas, timeout ? "API TIMEOUT" : "API CONNECTED", 8, 266, 1,
-            timeout ? color.red : color.green);
-  drawLabel(canvas, timeout ? "NO DATA" : "VALUES LIVE", 162, 266, 1, color.dim, TR_DATUM);
+  drawEdgePair(canvas, timeout ? "API TIMEOUT" : "API CONNECTED",
+               timeout ? "NO DATA" : "VALUES LIVE", 266,
+               timeout ? color.red : color.green, color.dim);
   drawFooter(canvas, Page::Timeout);
 }
 
@@ -688,20 +698,23 @@ void updatePageAnimation() {
       page_position -= shift;
       page_target -= shift;
     }
+    if (telemetry_redraw_pending) {
+      telemetry_redraw_pending = false;
+      invalidateFrames();
+    }
   }
   drawCurrentFrame();
 #endif
 }
 
-void clearRealtimeValues() {
-  state.cpu = state.memory = state.ping_ms = state.clients = -1;
-  state.cpu_temp_c = state.disk_temp_c = state.lan_speed_mbps = -1;
-  state.docker_running = state.docker_total = state.packet_loss = -1;
-  state.used_tb = state.total_tb = state.memory_used_gb = NAN;
-  state.load_1m = state.disk_read_mb_s = NAN;
-  state.down_mbps = state.up_mbps = NAN;
-  state.uptime_days = -1;
-  state.raid_status = "";
+void clearRealtimeValues(NasState &target) {
+  target.cpu = target.memory = target.gpu = target.api_rtt_ms = -1;
+  target.cpu_temp_c = target.disk_temp_c = target.lan_speed_mbps = -1;
+  target.used_tb = target.total_tb = target.memory_used_gb = NAN;
+  target.load_1m = target.disk_read_mb_s = NAN;
+  target.down_mbps = target.up_mbps = NAN;
+  target.uptime_days = -1;
+  target.raid_status = "";
 }
 
 String prometheusLabel(const String &line, const char *name) {
@@ -713,8 +726,8 @@ String prometheusLabel(const String &line, const char *name) {
   return end >= value_start ? line.substring(value_start, end) : String();
 }
 
-bool parsePrometheusMetrics(HTTPClient &http) {
-  clearRealtimeValues();
+bool parsePrometheusMetrics(HTTPClient &http, NasState &target) {
+  clearRealtimeValues(target);
   double memory_used = NAN;
   double memory_total = NAN;
   double storage_total = 0.0;
@@ -751,17 +764,19 @@ bool parsePrometheusMetrics(HTTPClient &http) {
     const double value = line.substring(line.lastIndexOf(' ') + 1).toDouble();
 
     if (name == "fnos_cpu_cpu_busy_all" || name == "fnos_cpu_usage") {
-      state.cpu = constrain(static_cast<int>(round(value)), 0, 100);
+      target.cpu = constrain(static_cast<int>(round(value)), 0, 100);
     } else if (name == "fnos_cpu_cpu_temp" || name == "fnos_cpu_temp") {
-      state.cpu_temp_c = max(state.cpu_temp_c, static_cast<int>(round(value)));
+      target.cpu_temp_c = max(target.cpu_temp_c, static_cast<int>(round(value)));
     } else if (name == "fnos_cpu_cpu_loadavg_avg1min") {
-      state.load_1m = static_cast<float>(value);
+      target.load_1m = static_cast<float>(value);
+    } else if (name == "fnos_gpu_busy") {
+      target.gpu = max(target.gpu, constrain(static_cast<int>(round(value)), 0, 100));
     } else if (name == "fnos_memory_mem_used") {
       memory_used = value;
     } else if (name == "fnos_memory_mem_total") {
       memory_total = value;
     } else if (name == "fnos_disk_temp") {
-      state.disk_temp_c = max(state.disk_temp_c, static_cast<int>(round(value)));
+      target.disk_temp_c = max(target.disk_temp_c, static_cast<int>(round(value)));
     } else if (name == "fnos_disk_read") {
       disk_read += value;
     } else if (name == "fnos_disk_smart_status_passed" && value < .5) {
@@ -781,100 +796,106 @@ bool parsePrometheusMetrics(HTTPClient &http) {
     } else if (name == "fnos_network_speed") {
       const String interface_name = prometheusLabel(line, "interface_name");
       if (running_interfaces.indexOf("," + interface_name + ",") >= 0)
-        state.lan_speed_mbps = max(state.lan_speed_mbps, static_cast<int>(round(value)));
+        target.lan_speed_mbps = max(target.lan_speed_mbps, static_cast<int>(round(value)));
     } else if (name == "fnos_network_receive") {
       network_receive += value;
     } else if (name == "fnos_network_transmit") {
       network_transmit += value;
     } else if (name == "fnos_uptime") {
-      state.uptime_days = max(0, static_cast<int>(value / 86400.0));
+      target.uptime_days = max(0, static_cast<int>(value / 86400.0));
     } else if (name == "fnos_host_name_info") {
       const String host_name = prometheusLabel(line, "host_name");
-      if (host_name.length()) state.hostname = host_name;
+      if (host_name.length()) target.hostname = host_name;
     }
   }
 
-  if (isfinite(memory_used)) state.memory_used_gb = memory_used / 1073741824.0;
+  if (isfinite(memory_used)) target.memory_used_gb = memory_used / 1073741824.0;
   if (isfinite(memory_used) && isfinite(memory_total) && memory_total > 0.0)
-    state.memory = constrain(static_cast<int>(round(memory_used / memory_total * 100.0)), 0, 100);
+    target.memory = constrain(static_cast<int>(round(memory_used / memory_total * 100.0)), 0, 100);
   if (saw_storage_total && storage_total > 0.0) {
-    state.total_tb = storage_total / 1099511627776.0;
-    if (saw_storage_free) state.used_tb = max(0.0, storage_total - storage_free) / 1099511627776.0;
+    target.total_tb = storage_total / 1099511627776.0;
+    if (saw_storage_free) target.used_tb = max(0.0, storage_total - storage_free) / 1099511627776.0;
   }
-  if (disk_read >= 0.0) state.disk_read_mb_s = disk_read / 1048576.0;
-  state.down_mbps = network_receive * 8.0 / 1000000.0;
-  state.up_mbps = network_transmit * 8.0 / 1000000.0;
-  state.raid_status = smart_ok ? "HEALTHY" : "DEGRADED";
+  if (disk_read >= 0.0) target.disk_read_mb_s = disk_read / 1048576.0;
+  target.down_mbps = network_receive * 8.0 / 1000000.0;
+  target.up_mbps = network_transmit * 8.0 / 1000000.0;
+  target.raid_status = smart_ok ? "HEALTHY" : "DEGRADED";
   return saw_fnos_metric;
 }
 
-bool fetchState() {
-#if FNOS_DEMO_MODE
-  const float phase = (millis() / 5000) * .35f;
-  state.demo = true;
-  state.online = false;
-  state.cpu = 12 + static_cast<int>((sinf(phase) + 1.0f) * 3.0f);
-  state.memory = 43;
-  state.ping_ms = 24 + static_cast<int>((sinf(phase * .7f) + 1.0f) * 3.0f);
-  state.clients = 14;
-  state.cpu_temp_c = 48;
-  state.disk_temp_c = 36;
-  state.lan_speed_mbps = 1000;
-  state.docker_running = 12;
-  state.docker_total = 14;
-  state.packet_loss = 0;
-  state.used_tb = 8.6f;
-  state.total_tb = 12.7f;
-  state.memory_used_gb = 8.4f;
-  state.load_1m = .42f;
-  state.disk_read_mb_s = 4.0f;
-  state.down_mbps = 128.6f + sinf(phase) * 8.0f;
-  state.up_mbps = 12.4f + sinf(phase * .8f) * 1.2f;
-  state.uptime_days = 127;
-  state.hostname = "FNOS";
-  state.raid_status = "HEALTHY";
-  state.error = "";
-  state.last_good_ms = max<uint32_t>(1, millis());
-  return true;
-#else
-  state.demo = false;
+bool fetchState(NasState &target) {
   if (WiFi.status() != WL_CONNECTED) {
-    state.online = false;
-    state.error = "Wi-Fi unavailable";
-    clearRealtimeValues();
+    target.online = false;
+    target.error = "Wi-Fi unavailable";
+    clearRealtimeValues(target);
     return false;
   }
   HTTPClient http;
   http.setTimeout(3000);
   http.begin(String("http://") + FNOS_HOST + FNOS_API_PATH);
   if (strlen(FNOS_API_TOKEN) > 0) http.addHeader("Authorization", String("Bearer ") + FNOS_API_TOKEN);
+  const uint32_t request_started_ms = millis();
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    state.online = false;
-    state.error = code > 0 ? "HTTP " + String(code) : "request timeout";
-    clearRealtimeValues();
+    target.online = false;
+    target.error = code > 0 ? "HTTP " + String(code) : "request timeout";
+    clearRealtimeValues(target);
     http.end();
     return false;
   }
-  if (!parsePrometheusMetrics(http)) {
+  if (!parsePrometheusMetrics(http, target)) {
     http.end();
-    state.online = false;
-    state.error = "metrics empty";
-    clearRealtimeValues();
+    target.online = false;
+    target.error = "metrics empty";
+    clearRealtimeValues(target);
     return false;
   }
+  target.api_rtt_ms = min<int>(9999, static_cast<int>(millis() - request_started_ms));
   http.end();
-  state.online = true;
-  state.error = "";
-  state.last_good_ms = max<uint32_t>(1, millis());
+  target.online = true;
+  target.error = "";
+  target.last_good_ms = max<uint32_t>(1, millis());
   return true;
-#endif
+}
+
+void telemetryWorker(void *) {
+  TickType_t next_wake = xTaskGetTickCount();
+  const TickType_t refresh_ticks = pdMS_TO_TICKS(REFRESH_MS);
+  for (;;) {
+    vTaskDelayUntil(&next_wake, refresh_ticks);
+    fetchState(collector_state);
+    if (xSemaphoreTake(telemetry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      pending_state = collector_state;
+      telemetry_ready = true;
+      xSemaphoreGive(telemetry_mutex);
+    }
+    if (xTaskGetTickCount() - next_wake >= refresh_ticks) next_wake = xTaskGetTickCount();
+  }
+}
+
+void consumeTelemetry() {
+  if (!telemetry_ready || telemetry_mutex == nullptr) return;
+  if (xSemaphoreTake(telemetry_mutex, 0) != pdTRUE) return;
+  if (telemetry_ready) {
+    state = pending_state;
+    telemetry_ready = false;
+  }
+  xSemaphoreGive(telemetry_mutex);
+  announceTelemetry();
+  appendCurrentStateToHistory();
+  if (fabsf(page_position - page_target) < .0005f && fabsf(page_velocity) < .002f) {
+    invalidateFrames();
+  } else {
+    telemetry_redraw_pending = true;
+  }
 }
 
 void announceTelemetry() {
   Serial.printf(
-      "FNOS_STATE online=%s demo=%s cpu=%d memory=%d down=%.2f up=%.2f error=%s\n",
-      state.online ? "yes" : "no", state.demo ? "yes" : "no", state.cpu, state.memory,
+      "FNOS_STATE online=%s cpu=%d memory=%d gpu=%d api_rtt=%dms "
+      "storage=%d disk_temp=%dC lan=%dM down=%.2f up=%.2f error=%s\n",
+      state.online ? "yes" : "no", state.cpu, state.memory, state.gpu,
+      state.api_rtt_ms, storagePercent(), state.disk_temp_c, state.lan_speed_mbps,
       state.down_mbps, state.up_mbps, state.error.length() ? state.error.c_str() : "none");
 }
 
@@ -893,14 +914,33 @@ void initFrames() {
                 psramFound() ? "yes" : "no");
 }
 
+void initBacklightOff() {
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON ? LOW : HIGH);
+  ledcSetup(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_PWM_HZ, BACKLIGHT_PWM_BITS);
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, 0);
+  ledcAttachPin(TFT_BL, BACKLIGHT_PWM_CHANNEL);
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, 0);
+}
+
+void setBacklightPercent(uint8_t percent) {
+  const uint8_t clamped = constrain(percent, 0, 100);
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, clamped * 255U / 100U);
+}
+
+void fadeInBacklight() {
+  constexpr uint8_t steps = 12;
+  for (uint8_t step = 1; step <= steps; ++step) {
+    setBacklightPercent(BACKLIGHT_PERCENT * step / steps);
+    delay(BACKLIGHT_FADE_MS / steps);
+  }
+}
+
 }  // namespace
 
 void setup() {
+  initBacklightOff();
   Serial.begin(115200);
-  pinMode(LCD_POWER_ON, OUTPUT);
-  digitalWrite(LCD_POWER_ON, HIGH);
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
   pinMode(BUTTON_1, INPUT_PULLUP);
   pinMode(BUTTON_2, INPUT_PULLUP);
   tft.init();
@@ -912,30 +952,28 @@ void setup() {
   tft.drawString("FNOS MONITOR", SCREEN_W / 2, 148, 2);
   tft.setTextColor(color.dim);
   tft.drawString("building 7 views...", SCREEN_W / 2, 172, 1);
-#if !FNOS_DEMO_MODE
   WiFi.mode(WIFI_STA);
   WiFi.begin(FNOS_WIFI_SSID, FNOS_WIFI_PASSWORD);
-#endif
-  fetchState();
+  fetchState(state);
   announceTelemetry();
   seedHistories();
   initFrames();
   invalidateFrames();
   drawCurrentFrame();
+  fadeInBacklight();
   announcePage();
-  last_refresh = millis();
+  collector_state = state;
+  pending_state = state;
+  telemetry_mutex = xSemaphoreCreateMutex();
+  if (telemetry_mutex != nullptr) {
+    xTaskCreate(telemetryWorker, "fnos-telemetry", 8192, nullptr, 1, &telemetry_task);
+  }
 }
 
 void loop() {
   updateButton(previous_button, -1);
   updateButton(next_button, 1);
-  if (millis() - last_refresh >= REFRESH_MS) {
-    last_refresh = millis();
-    fetchState();
-    announceTelemetry();
-    appendCurrentStateToHistory();
-    invalidateFrames();
-  }
+  consumeTelemetry();
   updatePageAnimation();
   delay(2);
 }

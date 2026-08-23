@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- 1 秒实时遥测：独立采集任务流式解析 `fnos-exporter` 的 `/metrics`，请求不阻塞按键与页面动画，耗时超过周期时从完成后重新计时。
+- 背光 PWM 淡入：启动保持熄灭，首帧完成后点亮并限制为 50%。
+- 主页面展示 exporter 实测响应时间 `API RT`，系统页展示 GPU 占用、存储健康与磁盘温度。
+- `fitLabel`/`drawEdgePair` 宽度拟合标签，适配窄屏长字符串。
+
+### Changed
+
+- 移除离线演示模式；缺少 `include/local_config.h` 时编译明确失败，固件只连接真实 `fnos-exporter`。
+- 轮询周期从 5 秒缩短到 1 秒，趋势历史窗口同步为 14 秒。
+- 页面切换沿用弹簧动画，遥测更新不再阻塞动画。
+
+### Fixed
+
+- 修复背光使用未定义宏 `LCD_BL`/`LCD_POWER_ON` 导致的屏幕黑屏：背光改由 `TFT_BL`（GPIO38）经 PWM 控制，契约测试同步对齐并新增防回归断言。
+
 ## [0.3.0] - 2026-07-18
 
 ### Added
@@ -37,7 +54,7 @@
 
 - 初始模板：PlatformIO + ESP-IDF 三环境（`xiao_esp32c3` / `xiao_esp32s3` / `xiao_esp32c6`），分层 sdkconfig。
 - `include/xiao_pins.h`：XIAO 丝印 D0–D10 到各板 GPIO 的符号映射及 I2C/UART/SPI 默认引脚。
-- `components/xiao_board`：板级支持组件（用户 LED 心跳、板级信息 API），`main.c` 演示调用。
+- `components/xiao_board`：板级支持组件（用户 LED 心跳、板级信息 API），`main.c` 调用示例。
 - MkDocs Material 中文文档站：硬件、引脚、固件、外围设备、调试、资料索引，以及 `docs/peripherals/_template.md` 外设页模板。
 - GitHub Actions：固件三环境矩阵构建（含 PlatformIO 缓存）与 MkDocs Pages 部署。
 - Apache-2.0 LICENSE。

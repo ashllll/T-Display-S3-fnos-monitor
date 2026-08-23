@@ -1,13 +1,13 @@
 # T-Display-S3 fnOS Monitor
 
-独立的 LilyGO T-Display-S3 飞牛 NAS 状态监控项目。屏幕目标是 170×320 ST7789，默认使用安全的离线演示数据，不包含 Wi-Fi、NAS 地址或 token。
+独立的 LilyGO T-Display-S3 飞牛 NAS 状态监控项目。屏幕目标是 170×320 ST7789，仅连接用户配置的真实 `fnos-exporter`，仓库不包含 Wi-Fi、NAS 地址或 token。
 
 ## 第一版目标
 
-- 顶部：NAS 名称、在线/离线/演示状态
+- 顶部：NAS 名称和在线/离线状态
 - 中部：CPU、内存、存储占用
 - 底部：下载/上传吞吐、简化趋势纹理、运行天数
-- 轮询周期：5 秒；网络失败必须显示 OFFLINE/错误原因，不伪装成实时数据
+- 轮询周期：1 秒；网络失败必须显示 OFFLINE/错误原因，不伪装成实时数据
 
 ## 构建
 
@@ -15,7 +15,7 @@
 pio run -e fnos_monitor
 ```
 
-首次编译会下载 PlatformIO 依赖。项目固定 `espressif32@7.0.1`，使用 Arduino 框架以复用 T-Display-S3 的 ST7789 板卡支持。
+首次编译会下载 PlatformIO 依赖。项目固定 `espressif32@7.0.1`，使用 Arduino 框架以复用 T-Display-S3 的 ST7789 板卡支持。没有 `include/local_config.h` 时构建会明确失败，防止生成不含真实数据配置的固件。
 
 ## 接入真实 fnOS
 
@@ -33,4 +33,4 @@ cp include/local_config.example.h include/local_config.h
 
 ## 硬件边界
 
-本项目只针对 LilyGO T-Display-S3，不等同于 Seeed XIAO ESP32-S3。GPIO、Flash/PSRAM、LCD 排线和 USB-JTAG 以实际板卡型号及官方资料为准。编译或烧录成功不等于屏幕布局、字体清晰度及实时数据已经通过实机验收。
+本项目只针对 LilyGO T-Display-S3，不等同于 Seeed XIAO ESP32-S3。GPIO、Flash/PSRAM、LCD 排线和 USB-JTAG 以实际板卡型号及官方资料为准。启动时背光保持关闭，首帧完成后以 PWM 点亮并限制为 50%。编译或烧录成功不等于屏幕布局、字体清晰度及实时数据已经通过实机验收。
