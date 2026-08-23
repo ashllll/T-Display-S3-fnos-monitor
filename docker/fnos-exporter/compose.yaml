@@ -1,0 +1,12 @@
+services:
+  fnos-exporter:
+    image: ghcr.io/timandes/fnos-prometheus-exporter:v0.5.0
+    container_name: fnos-exporter
+    restart: unless-stopped
+    environment:
+      FNOS_HOST: "192.168.9.23:5666"
+      FNOS_USER: "请在飞牛界面中填写管理员用户名"
+      FNOS_PASSWORD: "请在飞牛界面中填写管理员密码"
+      FNOS_LOG_LEVEL: "INFO"
+    ports:
+      - "192.168.9.23:9100:9100"
