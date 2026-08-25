@@ -1,0 +1,12 @@
+FNOS_STATE online=yes cpu=1 memory=52 gpu=0 api_rtt=402ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=1 memory=52 gpu=0 api_rtt=400ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=524ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=414ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=405ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=711ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=417ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=395ms storage=29 disk_temp=43C lan=10000M down=0.12 up=1.61 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=409ms storage=29 disk_temp=43C lan=10000M down=0.09 up=1.33 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=457ms storage=29 disk_temp=43C lan=10000M down=0.09 up=1.33 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=408ms storage=29 disk_temp=43C lan=10000M down=0.09 up=1.33 error=none
+FNOS_STATE online=yes cpu=2 memory=52 gpu=0 api_rtt=411ms storage=29 disk_temp=43C lan=10000M down=0.09 up=1.33 error=none

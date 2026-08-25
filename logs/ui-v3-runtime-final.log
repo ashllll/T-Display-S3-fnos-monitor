@@ -1,0 +1,10 @@
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=3 memory=52 gpu=0 api_rtt=408ms storage=29 disk_temp=43C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=3 memory=52 gpu=0 api_rtt=424ms storage=29 disk_temp=43C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=3 memory=52 gpu=0 api_rtt=438ms storage=29 disk_temp=43C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=3 memory=52 gpu=0 api_rtt=398ms storage=29 disk_temp=43C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=3 memory=52 gpu=0 api_rtt=428ms storage=29 disk_temp=43C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=1 memory=52 gpu=0 api_rtt=448ms storage=29 disk_temp=42C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=1 memory=52 gpu=0 api_rtt=411ms storage=29 disk_temp=42C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=1 memory=52 gpu=0 api_rtt=651ms storage=29 disk_temp=42C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=1 memory=52 gpu=0 api_rtt=404ms storage=29 disk_temp=42C lan=10000M down=0.05 up=1.10 fetch=ok
+FNOS_STATE ui=render-v3.0-seven-page online=yes cpu=1 memory=52 gpu=0 api_rtt=394ms storage=29 disk_temp=42C lan=10000M down=0.05 up=1.10 fetch=ok
