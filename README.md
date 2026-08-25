@@ -31,6 +31,8 @@ cp include/local_config.example.h include/local_config.h
 
 使用 CUKTECH `system` + `network` 混合 profile：健康摘要优先，吞吐作为底部动态纹理；黑底、等宽数字、颜色与文案双编码状态。小字号和主数字必须在真实屏幕上分别验收，编译通过不等于字体清晰或布局通过。
 
+完整实现的七页 170×320 UI、逐页 PNG/SVG、布局契约和验证记录见 [`docs/ui-design-v3.md`](docs/ui-design-v3.md)。旧版概念说明保留在 [`docs/ui-design-v2.md`](docs/ui-design-v2.md)。
+
 ## 硬件边界
 
 本项目只针对 LilyGO T-Display-S3，不等同于 Seeed XIAO ESP32-S3。GPIO、Flash/PSRAM、LCD 排线和 USB-JTAG 以实际板卡型号及官方资料为准。启动时背光保持关闭，首帧完成后以 PWM 点亮并限制为 50%。编译或烧录成功不等于屏幕布局、字体清晰度及实时数据已经通过实机验收。

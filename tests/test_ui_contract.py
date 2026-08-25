@@ -5,6 +5,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
 EXAMPLE_CONFIG = (ROOT / "include" / "local_config.example.h").read_text(encoding="utf-8")
+REFERENCE_DIR = ROOT / "docs" / "assets" / "ui-v3"
 
 
 class UiContractTests(unittest.TestCase):
@@ -78,14 +79,111 @@ class UiContractTests(unittest.TestCase):
 
     def test_labels_are_width_bounded(self):
         self.assertIn("String fitLabel(", SOURCE)
+        self.assertIn("void drawBoundedLabel(", SOURCE)
+        self.assertIn("void drawBoundedPair(", SOURCE)
         self.assertIn("void drawEdgePair(", SOURCE)
         self.assertIn("fitLabel(canvas, title, 2, title_width)", SOURCE)
 
+    def test_dynamic_values_and_units_have_non_overlapping_width_budgets(self):
+        self.assertIn("void drawValueUnit(", SOURCE)
+        self.assertIn("width - unit_width - gap", SOURCE)
+        self.assertIn("const String fitted = found ? text : fitLabel", SOURCE)
+        self.assertEqual(SOURCE.count("drawValueUnit(canvas"), 5)
+        self.assertIn("void drawHeroBlock(", SOURCE)
+        self.assertNotIn('drawLabel(canvas, "Mb/s"', SOURCE)
+
+    def test_render_reference_panels_and_state_bands_are_shared_components(self):
+        self.assertIn("void drawPanel(", SOURCE)
+        self.assertGreaterEqual(SOURCE.count("drawPanel(canvas"), 11)
+        self.assertIn("void drawTrendPanel(", SOURCE)
+        self.assertIn("void drawStateBand(", SOURCE)
+        self.assertEqual(SOURCE.count("drawStateBand(canvas"), 3)
+        self.assertIn("canvas.drawRoundRect(ui::edge, ui::state_y, ui::content_width, ui::state_h, 6,", SOURCE)
+        self.assertIn("canvas.drawFastVLine(84, 174, 21, color.guide);", SOURCE)
+        self.assertIn("int16_t max_width = SCREEN_W", SOURCE)
+        self.assertIn('UI_BUILD_ID = "render-v3.0-seven-page"', SOURCE)
+        self.assertIn("canvas.drawRect(0, 0, SCREEN_W, SCREEN_H, color.guide);", SOURCE)
+        self.assertIn('Serial.printf("UI_BUILD %s pages=%u adaptive=yes', SOURCE)
+
     def test_page_motion_is_interruptible_and_not_blocked_by_network(self):
         self.assertIn("constexpr float SPRING_RESPONSE = 0.28f;", SOURCE)
+        self.assertIn("void advancePageSpring(float delta)", SOURCE)
+        self.assertIn("expf(-omega * delta)", SOURCE)
+        self.assertIn("page_velocity + omega * displacement", SOURCE)
+        self.assertNotIn("const float acceleration =", SOURCE)
         self.assertIn('xTaskCreate(telemetryWorker, "fnos-telemetry"', SOURCE)
         self.assertIn("page_target += direction;", SOURCE)
         self.assertIn("telemetry_redraw_pending = true;", SOURCE)
+
+    def test_cuktech_v2_uses_semantic_tokens_and_stable_identity_colors(self):
+        self.assertIn("namespace ui {", SOURCE)
+        self.assertIn("constexpr int16_t edge = 8;", SOURCE)
+        self.assertIn('drawLabel(canvas, "UPLOAD", 8, 96, 1, color.blue);', SOURCE)
+        self.assertIn('drawBoundedLabel(canvas, "WAN UP", 8, 111, 54, 1, color.blue);', SOURCE)
+        self.assertIn('drawTopologyNode(canvas, 9, "NAS", color.blue', SOURCE)
+        self.assertIn('drawTopologyNode(canvas, 64, "WIFI", color.cyan', SOURCE)
+        self.assertIn('drawTopologyNode(canvas, 118, "LCD", color.lime', SOURCE)
+        self.assertIn("canvas.fillRoundRect(x - 4, ui::footer_indicator_y - 2, 8, 4", SOURCE)
+
+    def test_v3_has_fixed_non_overlapping_vertical_regions(self):
+        expected = {
+            "header_bottom": 26,
+            "state_y": 30,
+            "state_h": 32,
+            "hero_label_y": 74,
+            "hero_value_y": 84,
+            "hero_unit_y": 111,
+            "trend_y": 134,
+            "trend_h": 63,
+            "tiles_y": 207,
+            "summary_y": 266,
+            "footer_y": 294,
+        }
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                self.assertIn(f"constexpr int16_t {name} = {value};", SOURCE)
+        self.assertLess(expected["header_bottom"], expected["state_y"])
+        self.assertLess(expected["state_y"] + expected["state_h"], expected["hero_label_y"])
+        self.assertLess(expected["hero_unit_y"], expected["trend_y"])
+        self.assertLess(expected["trend_y"] + expected["trend_h"], expected["tiles_y"])
+        self.assertLess(expected["tiles_y"] + 38, expected["summary_y"])
+        self.assertLess(expected["summary_y"], expected["footer_y"])
+
+    def test_all_seven_page_functions_use_v3_components(self):
+        for name in ("Overview", "Network", "Storage", "System", "Normal", "HighLoad", "Timeout"):
+            self.assertIn(f"void draw{name}(TFT_eSprite &canvas)", SOURCE)
+        self.assertEqual(SOURCE.count("drawPageAccent(canvas"), 7)
+        self.assertEqual(SOURCE.count("case Page::"), 7)
+        self.assertEqual(SOURCE.count("drawHeroBlock(canvas"), 3)
+        self.assertEqual(SOURCE.count("drawTrendPanel(canvas"), 2)
+
+    def test_seven_native_resolution_reference_images_exist(self):
+        names = (
+            "01-overview-170x320", "02-network-170x320", "03-storage-170x320",
+            "04-system-170x320", "05-normal-170x320", "06-high-load-170x320",
+            "07-timeout-170x320",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue((REFERENCE_DIR / f"{name}.svg").is_file())
+                self.assertTrue((REFERENCE_DIR / f"{name}.png").is_file())
+                svg = (REFERENCE_DIR / f"{name}.svg").read_text(encoding="utf-8")
+                self.assertIn('width="170" height="320" viewBox="0 0 170 320"', svg)
+
+    def test_data_trust_distinguishes_warming_live_stale_and_offline(self):
+        self.assertIn("enum class DataTrust : uint8_t { Warming, Live, Stale, Offline };", SOURCE)
+        self.assertIn("constexpr uint32_t STALE_AFTER_MS = REFRESH_MS * 3;", SOURCE)
+        self.assertIn("constexpr uint32_t OFFLINE_AFTER_MS = REFRESH_MS * 10;", SOURCE)
+        self.assertIn('case DataTrust::Warming: return "WARMING";', SOURCE)
+        self.assertIn('return "STALE " + String(', SOURCE)
+        self.assertIn('case DataTrust::Offline: return "OFFLINE";', SOURCE)
+        self.assertIn("state.consecutive_failures < 3", SOURCE)
+        self.assertIn("candidate.consecutive_failures = 0;", SOURCE)
+        self.assertIn("NasState candidate = target;", SOURCE)
+        self.assertIn("parsePrometheusMetrics(http, candidate)", SOURCE)
+        self.assertIn("target = candidate;", SOURCE)
+        setup_source = SOURCE[SOURCE.index("void setup()") : SOURCE.index("void loop()")]
+        self.assertNotIn("fetchState(state);", setup_source)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ nav:
   - 首页: index.md
   - 快速开始: getting-started.md
   - 开发流程: workflow.md
+  - UI v3 七页实现: ui-design-v3.md
+  - UI v2 概念稿: ui-design-v2.md
   - 硬件:
       - XIAO 型号: hardware/boards.md
       - 引脚定义: hardware/pinout.md

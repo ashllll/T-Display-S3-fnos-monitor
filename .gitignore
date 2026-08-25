@@ -21,3 +21,6 @@ sdkconfig.old
 build/
 .DS_Store
 __pycache__/
+
+# 运行时日志
+logs/

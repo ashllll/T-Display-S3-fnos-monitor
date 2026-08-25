@@ -21,6 +21,8 @@ constexpr int16_t SCREEN_H = 320;
 constexpr uint8_t PAGE_COUNT = 7;
 constexpr uint8_t HISTORY_COUNT = 14;
 constexpr uint32_t REFRESH_MS = 1000;
+constexpr uint32_t STALE_AFTER_MS = REFRESH_MS * 3;
+constexpr uint32_t OFFLINE_AFTER_MS = REFRESH_MS * 10;
 constexpr uint16_t HISTORY_WINDOW_SECONDS = HISTORY_COUNT * REFRESH_MS / 1000;
 constexpr uint32_t FRAME_INTERVAL_US = 16667;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 18;
@@ -29,18 +31,39 @@ constexpr uint8_t BACKLIGHT_PWM_CHANNEL = 7;
 constexpr uint8_t BACKLIGHT_PWM_BITS = 8;
 constexpr uint16_t BACKLIGHT_PWM_HZ = 12000;
 constexpr uint16_t BACKLIGHT_FADE_MS = 120;
+constexpr const char *UI_BUILD_ID = "render-v3.0-seven-page";
 constexpr float SPRING_RESPONSE = 0.28f;
 constexpr float SPRING_OMEGA = 2.0f * PI / SPRING_RESPONSE;
 
+namespace ui {
+constexpr int16_t edge = 8;
+constexpr int16_t content_width = SCREEN_W - edge * 2;
+constexpr int16_t panel_radius = 7;
+constexpr int16_t header_bottom = 26;
+constexpr int16_t state_y = 30;
+constexpr int16_t state_h = 32;
+constexpr int16_t hero_label_y = 74;
+constexpr int16_t hero_value_y = 84;
+constexpr int16_t hero_unit_y = 111;
+constexpr int16_t trend_y = 134;
+constexpr int16_t trend_h = 63;
+constexpr int16_t tiles_y = 207;
+constexpr int16_t summary_y = 266;
+constexpr int16_t footer_y = 294;
+constexpr int16_t footer_indicator_y = 298;
+}  // namespace ui
+
 enum class Page : uint8_t { Overview, Network, Storage, System, Normal, HighLoad, Timeout };
+enum class DataTrust : uint8_t { Warming, Live, Stale, Offline };
 
 struct Palette {
   uint16_t background, panel, panel_alt, text, dim, idle, guide;
-  uint16_t cyan, blue, green, amber, orange, red;
+  uint16_t cyan, blue, lime, green, amber, orange, red;
 };
 
 struct NasState {
   bool online = false;
+  uint8_t consecutive_failures = 0;
   int cpu = -1;
   int memory = -1;
   int gpu = -1;
@@ -114,20 +137,69 @@ int pageModulo(int value) {
   return result < 0 ? result + PAGE_COUNT : result;
 }
 
-bool realtimeValid() { return state.online; }
+uint16_t dimColor(uint16_t value, uint8_t percent);
+
+DataTrust dataTrust() {
+  if (state.last_good_ms == 0)
+    return state.consecutive_failures < 3 ? DataTrust::Warming : DataTrust::Offline;
+  const uint32_t age_ms = millis() - state.last_good_ms;
+  if (state.online && age_ms <= STALE_AFTER_MS) return DataTrust::Live;
+  if (age_ms <= OFFLINE_AFTER_MS) return DataTrust::Stale;
+  return DataTrust::Offline;
+}
+
+bool realtimeValid() { return dataTrust() == DataTrust::Live; }
+
+bool telemetryReadable() {
+  const DataTrust trust = dataTrust();
+  return trust == DataTrust::Live || trust == DataTrust::Stale;
+}
+
+String trustLabel() {
+  switch (dataTrust()) {
+    case DataTrust::Warming: return "WARMING";
+    case DataTrust::Live: return "LIVE";
+    case DataTrust::Stale:
+      return "STALE " + String((millis() - state.last_good_ms) / 1000) + "S";
+    case DataTrust::Offline: return "OFFLINE";
+  }
+  return "NO DATA";
+}
+
+uint16_t trustColor() {
+  switch (dataTrust()) {
+    case DataTrust::Warming: return color.dim;
+    case DataTrust::Live: return color.green;
+    case DataTrust::Stale: return color.amber;
+    case DataTrust::Offline: return color.red;
+  }
+  return color.dim;
+}
+
+uint16_t readingColor(uint16_t live_color) {
+  if (dataTrust() == DataTrust::Stale) return dimColor(live_color, 52);
+  if (dataTrust() == DataTrust::Warming || dataTrust() == DataTrust::Offline) return color.idle;
+  return live_color;
+}
 
 int storagePercent() {
+  if (!telemetryReadable()) return -1;
   if (!isfinite(state.used_tb) || !isfinite(state.total_tb) || state.total_tb <= 0.0f) return -1;
   return constrain(static_cast<int>(roundf(state.used_tb / state.total_tb * 100.0f)), 0, 100);
 }
 
 String floatValue(float value, uint8_t decimals = 1) {
-  return isfinite(value) ? String(value, static_cast<unsigned int>(decimals)) : String("--.-");
+  return telemetryReadable() && isfinite(value)
+             ? String(value, static_cast<unsigned int>(decimals)) : String("--.-");
 }
 
-String percentValue(int value) { return value >= 0 ? String(value) + "%" : String("--%"); }
-String intValue(int value) { return value >= 0 ? String(value) : String("--"); }
-String uptimeValue() { return state.uptime_days >= 0 ? String(state.uptime_days) + "d" : String("--d"); }
+String percentValue(int value) {
+  return telemetryReadable() && value >= 0 ? String(value) + "%" : String("--%");
+}
+String intValue(int value) { return telemetryReadable() && value >= 0 ? String(value) : String("--"); }
+String uptimeValue() {
+  return telemetryReadable() && state.uptime_days >= 0 ? String(state.uptime_days) + "d" : String("--d");
+}
 
 uint16_t dimColor(uint16_t value, uint8_t percent) {
   const uint16_t r = ((value >> 11) & 0x1F) * percent / 100;
@@ -146,6 +218,7 @@ void initPalette() {
   color.guide = tft.color565(37, 49, 62);
   color.cyan = tft.color565(55, 196, 214);
   color.blue = tft.color565(63, 169, 245);
+  color.lime = tft.color565(200, 230, 60);
   color.green = tft.color565(54, 210, 126);
   color.amber = tft.color565(255, 200, 0);
   color.orange = tft.color565(255, 122, 26);
@@ -169,33 +242,66 @@ String fitLabel(TFT_eSprite &canvas, const String &text, uint8_t font, int16_t m
   return "";
 }
 
+void drawBoundedLabel(TFT_eSprite &canvas, const String &text, int16_t x, int16_t y,
+                      int16_t width, uint8_t font, uint16_t text_color,
+                      uint8_t datum = TL_DATUM) {
+  const String fitted = fitLabel(canvas, text, font, width);
+  int16_t anchor_x = x;
+  if (datum == TR_DATUM || datum == MR_DATUM || datum == BR_DATUM) anchor_x += width;
+  else if (datum == TC_DATUM || datum == MC_DATUM || datum == BC_DATUM) anchor_x += width / 2;
+  drawLabel(canvas, fitted, anchor_x, y, font, text_color, datum);
+}
+
+void drawBoundedPair(TFT_eSprite &canvas, const String &left, const String &right,
+                     int16_t x, int16_t y, int16_t width, int16_t gap,
+                     uint16_t left_color, uint16_t right_color) {
+  const String fitted_right = fitLabel(canvas, right, 1, width);
+  const int16_t right_width = canvas.textWidth(fitted_right, 1);
+  const int16_t left_width = max<int16_t>(0, width - gap - right_width);
+  drawBoundedLabel(canvas, left, x, y, left_width, 1, left_color);
+  drawLabel(canvas, fitted_right, x + width, y, 1, right_color, TR_DATUM);
+}
+
 void drawEdgePair(TFT_eSprite &canvas, const String &left, const String &right, int16_t y,
                   uint16_t left_color, uint16_t right_color) {
-  constexpr int16_t edge = 8;
-  constexpr int16_t gap = 8;
-  const int16_t right_width = min<int16_t>(canvas.textWidth(right, 1), SCREEN_W - edge * 2);
-  const int16_t left_width = SCREEN_W - edge * 2 - gap - right_width;
-  drawLabel(canvas, fitLabel(canvas, left, 1, left_width), edge, y, 1, left_color);
-  drawLabel(canvas, fitLabel(canvas, right, 1, SCREEN_W - edge * 2),
-            SCREEN_W - edge, y, 1, right_color, TR_DATUM);
+  drawBoundedPair(canvas, left, right, ui::edge, y, ui::content_width, 8,
+                  left_color, right_color);
+}
+
+void drawPanel(TFT_eSprite &canvas, int16_t x, int16_t y, int16_t width,
+               int16_t height, int16_t radius = ui::panel_radius,
+               uint16_t fill_color = 0, uint16_t border_color = 0) {
+  const uint16_t fill = fill_color ? fill_color : color.panel;
+  const uint16_t border = border_color ? border_color : color.guide;
+  canvas.fillRoundRect(x, y, width, height, radius, fill);
+  canvas.drawRoundRect(x, y, width, height, radius, border);
 }
 
 void drawTemperature(TFT_eSprite &canvas, int value, int16_t x, int16_t y,
-                     uint8_t font, uint16_t text_color, uint8_t datum = TL_DATUM) {
-  const String number = intValue(value);
-  const int16_t number_width = canvas.textWidth(number, font);
-  const int16_t c_width = canvas.textWidth("C", font);
-  const int16_t radius = font == 1 ? 1 : 2;
+                     uint8_t font, uint16_t text_color, uint8_t datum = TL_DATUM,
+                     int16_t max_width = SCREEN_W) {
+  String number = intValue(value);
+  uint8_t selected = font;
+  auto totalWidth = [&](const String &candidate, uint8_t candidate_font) {
+    const int16_t radius = candidate_font == 1 ? 1 : 2;
+    return canvas.textWidth(candidate, candidate_font) + radius * 2 + 3 +
+           canvas.textWidth("C", candidate_font);
+  };
+  if (totalWidth(number, selected) > max_width) selected = 1;
+  if (totalWidth(number, selected) > max_width) number = "--";
+  const int16_t number_width = canvas.textWidth(number, selected);
+  const int16_t c_width = canvas.textWidth("C", selected);
+  const int16_t radius = selected == 1 ? 1 : 2;
   const int16_t degree_width = radius * 2 + 3;
   const int16_t total_width = number_width + degree_width + c_width;
   int16_t left = x;
   if (datum == TR_DATUM || datum == MR_DATUM || datum == BR_DATUM) left -= total_width;
   else if (datum == TC_DATUM || datum == MC_DATUM || datum == BC_DATUM) left -= total_width / 2;
-  drawLabel(canvas, number, left, y, font, text_color);
+  drawLabel(canvas, number, left, y, selected, text_color);
   const int16_t degree_x = left + number_width + radius + 1;
   const int16_t degree_y = y + radius + 1;
   canvas.drawCircle(degree_x, degree_y, radius, text_color);
-  drawLabel(canvas, "C", left + number_width + degree_width, y, font, text_color);
+  drawLabel(canvas, "C", left + number_width + degree_width, y, selected, text_color);
 }
 
 void drawFitNumber(TFT_eSprite &canvas, const String &text, int16_t x, int16_t y,
@@ -203,38 +309,108 @@ void drawFitNumber(TFT_eSprite &canvas, const String &text, int16_t x, int16_t y
                    uint8_t datum = TL_DATUM) {
   const uint8_t fonts[] = {6, 4, 2, 1};
   uint8_t selected = 1;
+  bool found = false;
   for (uint8_t font : fonts) {
     if (canvas.textWidth(text, font) <= max_width && canvas.fontHeight(font) <= max_height) {
       selected = font;
+      found = true;
       break;
     }
   }
-  drawLabel(canvas, text, x, y, selected, text_color, datum);
+  const String fitted = found ? text : fitLabel(canvas, text, 1, max_width);
+  drawLabel(canvas, fitted, x, y, selected, text_color, datum);
+}
+
+void drawValueUnit(TFT_eSprite &canvas, const String &value, const String &unit,
+                   int16_t x, int16_t value_y, int16_t unit_y, int16_t width,
+                   int16_t max_height, uint16_t value_color, uint16_t unit_color) {
+  constexpr int16_t gap = 4;
+  const String fitted_unit = fitLabel(canvas, unit, 1, width / 3);
+  const int16_t unit_width = canvas.textWidth(fitted_unit, 1);
+  const int16_t number_width = max<int16_t>(1, width - unit_width - gap);
+  const int16_t number_right = x + number_width;
+  drawFitNumber(canvas, value, number_right, value_y, number_width, max_height,
+                value_color, TR_DATUM);
+  drawLabel(canvas, fitted_unit, x + width, unit_y, 1, unit_color, TR_DATUM);
 }
 
 void drawHeader(TFT_eSprite &canvas, const String &title, const String &status,
                 uint16_t status_color) {
   const String fitted_status = fitLabel(canvas, status, 1, 82);
-  const int16_t title_width = 146 - canvas.textWidth(fitted_status, 1);
-  drawLabel(canvas, fitLabel(canvas, title, 2, title_width), 8, 6, 2, color.text);
-  drawLabel(canvas, fitted_status, 162, 9, 1, status_color, TR_DATUM);
+  const int16_t status_width = canvas.textWidth(fitted_status, 1);
+  const int16_t title_width = 142 - status_width;
+  drawLabel(canvas, fitLabel(canvas, title, 2, title_width), ui::edge, 6, 2, color.text);
+  canvas.fillCircle(SCREEN_W - ui::edge - status_width - 6, 13, 2, status_color);
+  drawLabel(canvas, fitted_status, SCREEN_W - ui::edge, 9, 1, status_color, TR_DATUM);
+}
+
+void drawHistoryCurve(TFT_eSprite &canvas, int16_t x, int16_t y, int16_t width,
+                      int16_t height, const float *history, uint16_t line_color,
+                      uint8_t thickness, bool fill_area, float scale_min,
+                      float scale_max);
+
+void drawStateBand(TFT_eSprite &canvas, const String &text, uint16_t state_color,
+                   uint8_t font) {
+  canvas.fillRoundRect(ui::edge, ui::state_y, ui::content_width, ui::state_h, 6,
+                       dimColor(state_color, 8));
+  canvas.drawRoundRect(ui::edge, ui::state_y, ui::content_width, ui::state_h, 6,
+                       state_color);
+  drawBoundedLabel(canvas, text, 14, ui::state_y + ui::state_h / 2, 142, font,
+                   state_color, MC_DATUM);
+}
+
+void drawHeroBlock(TFT_eSprite &canvas, const String &label, const String &value,
+                   uint16_t identity_color, uint16_t unit_color = 0) {
+  drawBoundedLabel(canvas, label, ui::edge, ui::hero_label_y, ui::content_width,
+                   1, identity_color);
+  drawValueUnit(canvas, value, "Mb/s", ui::edge, ui::hero_value_y,
+                ui::hero_unit_y, ui::content_width, 48,
+                readingColor(color.text), unit_color ? unit_color : color.dim);
+}
+
+void drawTrendPanel(TFT_eSprite &canvas, const String &label,
+                    const float *history, uint16_t line_color,
+                    bool fill_area = false, float scale_min = NAN,
+                    float scale_max = NAN) {
+  drawPanel(canvas, ui::edge, ui::trend_y, ui::content_width, ui::trend_h);
+  drawBoundedLabel(canvas, label, 15, ui::trend_y + 7, 140, 1, color.dim);
+  drawHistoryCurve(canvas, 15, ui::trend_y + 20, 140, 36, history, line_color,
+                   2, fill_area, scale_min, scale_max);
+}
+
+void drawPageAccent(TFT_eSprite &canvas, uint16_t accent) {
+  canvas.fillRoundRect(ui::edge, ui::header_bottom - 2, ui::content_width, 2, 1,
+                       dimColor(accent, 65));
 }
 
 void drawFooter(TFT_eSprite &canvas, Page page) {
   const uint8_t active = static_cast<uint8_t>(page);
-  drawLabel(canvas, PAGE_NAMES[active], 8, 294, 1, color.text);
+  drawLabel(canvas, PAGE_NAMES[active], ui::edge, ui::footer_y, 1, color.text);
   for (uint8_t index = 0; index < PAGE_COUNT; ++index) {
-    canvas.fillCircle(102 + index * 10, 298, index == active ? 3 : 2,
-                      index == active ? color.text : color.idle);
+    const int16_t x = 101 + index * 9;
+    if (index == active) canvas.fillRoundRect(x - 4, ui::footer_indicator_y - 2, 8, 4, 2, color.text);
+    else canvas.fillCircle(x, ui::footer_indicator_y, 1, color.idle);
   }
 }
 
 void drawMetricTile(TFT_eSprite &canvas, int16_t x, int16_t y, int16_t width,
                     const String &name, const String &value, uint16_t value_color = 0) {
-  canvas.fillRoundRect(x, y, width, 38, 7, color.panel_alt);
-  drawLabel(canvas, name, x + 7, y + 7, 1, color.dim);
+  const uint16_t identity_color = value_color ? value_color : color.guide;
+  drawPanel(canvas, x, y, width, 38, ui::panel_radius, color.panel_alt,
+            dimColor(identity_color, 45));
+  canvas.fillRoundRect(x + 6, y + 6, 2, 9, 1, identity_color);
+  drawLabel(canvas, name, x + 12, y + 7, 1, color.dim);
   drawFitNumber(canvas, value, x + 7, y + 18, width - 12, 18,
-                value_color ? value_color : color.text);
+                readingColor(value_color ? value_color : color.text));
+}
+
+void drawTopologyNode(TFT_eSprite &canvas, int16_t x, const String &name,
+                      uint16_t identity_color, bool active) {
+  const uint16_t border = active ? identity_color : dimColor(identity_color, 42);
+  canvas.fillRoundRect(x, 38, 44, 24, 6,
+                       active ? dimColor(identity_color, 18) : color.panel);
+  canvas.drawRoundRect(x, 38, 44, 24, 6, border);
+  drawLabel(canvas, name, x + 22, 50, 1, border, MC_DATUM);
 }
 
 bool normalizeHistory(const float *source, uint8_t *target,
@@ -372,72 +548,69 @@ void appendCurrentStateToHistory() {
 }
 
 void drawOverview(TFT_eSprite &canvas) {
-  const String status = state.online ? "ONLINE" : "TIMEOUT";
-  drawHeader(canvas, "FNOS", status, state.online ? color.green : color.red);
+  drawHeader(canvas, "FNOS", trustLabel(), trustColor());
+  drawPageAccent(canvas, color.cyan);
   drawLabel(canvas, "DOWNLOAD", 8, 30, 1, color.cyan);
-  drawFitNumber(canvas, floatValue(state.down_mbps), 7, 42, 138, 48, color.text);
-  drawLabel(canvas, "Mb/s", 162, 68, 1, color.dim, TR_DATUM);
-  drawLabel(canvas, "UPLOAD", 8, 96, 1, color.green);
-  drawFitNumber(canvas, floatValue(state.up_mbps), 8, 105, 105, 26, color.text);
-  drawLabel(canvas, "Mb/s", 162, 113, 1, color.dim, TR_DATUM);
-  canvas.fillRoundRect(8, 135, 154, 67, 7, color.panel);
+  drawValueUnit(canvas, floatValue(state.down_mbps), "Mb/s", 8, 42, 68, 154, 48,
+                readingColor(color.text), color.dim);
+  drawLabel(canvas, "UPLOAD", 8, 96, 1, color.blue);
+  drawValueUnit(canvas, floatValue(state.up_mbps), "Mb/s", 8, 105, 113, 154, 26,
+                readingColor(color.text), color.dim);
+  drawPanel(canvas, 8, 135, 154, 67);
   drawLabel(canvas, String(HISTORY_WINDOW_SECONDS) + "S LIVE", 15, 142, 1, color.dim);
   const float network_scale = sharedNetworkScale();
   drawHistoryCurve(canvas, 14, 154, 142, 41, down_history, color.cyan, 2, true, 0.0f, network_scale);
-  drawHistoryCurve(canvas, 14, 169, 142, 25, up_history, color.green, 1, false, 0.0f, network_scale);
+  drawHistoryCurve(canvas, 14, 169, 142, 25, up_history, color.blue, 1, false, 0.0f, network_scale);
   drawMetricTile(canvas, 8, 213, 46, "API RT",
                  state.api_rtt_ms >= 0 ? String(state.api_rtt_ms) + "ms" : "--ms", color.orange);
   drawMetricTile(canvas, 62, 213, 46, "MEM", percentValue(state.memory));
   drawMetricTile(canvas, 116, 213, 46, "DISK", percentValue(storagePercent()), color.amber);
-  drawLabel(canvas, "CPU " + percentValue(state.cpu), 8, 263, 1, color.dim);
-  drawLabel(canvas, "TEMP", 62, 263, 1, color.dim);
-  drawTemperature(canvas, state.cpu_temp_c, 120, 263, 1, color.dim, TR_DATUM);
-  drawLabel(canvas, uptimeValue(), 162, 263, 1, color.dim, TR_DATUM);
+  drawBoundedLabel(canvas, "CPU " + percentValue(state.cpu), 8, 263, 48, 1, color.dim);
+  drawBoundedLabel(canvas, "TEMP", 62, 263, 27, 1, color.dim);
+  drawTemperature(canvas, state.cpu_temp_c, 120, 263, 1, color.dim, TR_DATUM, 31);
+  drawBoundedLabel(canvas, uptimeValue(), 132, 263, 30, 1, color.dim, TR_DATUM);
   drawFooter(canvas, Page::Overview);
 }
 
 void drawNetwork(TFT_eSprite &canvas) {
-  drawHeader(canvas, "NETWORK", state.online ? "HEALTHY" : "OFFLINE",
-             state.online ? color.green : color.red);
-  canvas.fillRoundRect(8, 29, 154, 43, 8, color.panel);
-  canvas.fillCircle(22, 50, 7, dimColor(color.cyan, 28));
-  canvas.drawCircle(22, 50, 7, color.cyan);
-  drawLabel(canvas, "W", 22, 50, 1, color.cyan, MC_DATUM);
-  canvas.drawLine(34, 50, 64, 50, color.cyan);
-  canvas.fillTriangle(66, 50, 60, 46, 60, 54, color.cyan);
-  canvas.fillCircle(82, 50, 7, dimColor(color.blue, 28));
-  canvas.drawCircle(82, 50, 7, color.blue);
-  drawLabel(canvas, "N", 82, 50, 1, color.blue, MC_DATUM);
-  canvas.drawLine(94, 50, 124, 50, color.green);
-  canvas.fillTriangle(126, 50, 120, 46, 120, 54, color.green);
-  canvas.fillCircle(142, 50, 7, dimColor(color.green, 25));
-  canvas.drawCircle(142, 50, 7, color.green);
-  drawLabel(canvas, "L", 142, 50, 1, color.green, MC_DATUM);
-  drawLabel(canvas, "WAN DOWN", 8, 83, 1, color.cyan);
-  drawFitNumber(canvas, floatValue(state.down_mbps), 162, 78, 105, 26, color.text, TR_DATUM);
-  drawLabel(canvas, "WAN UP", 8, 111, 1, color.green);
-  drawFitNumber(canvas, floatValue(state.up_mbps), 162, 106, 105, 26, color.text, TR_DATUM);
-  canvas.fillRoundRect(8, 139, 154, 61, 7, color.panel);
-  drawLabel(canvas, "API RTT " + String(HISTORY_WINDOW_SECONDS) + "S  " +
-                        intValue(state.api_rtt_ms) + "ms", 15, 146, 1, color.dim);
+  drawHeader(canvas, "NETWORK", trustLabel(), trustColor());
+  drawPageAccent(canvas, color.blue);
+  drawPanel(canvas, 8, 29, 154, 43, 8);
+  const bool source_active = realtimeValid();
+  const bool wifi_active = WiFi.status() == WL_CONNECTED;
+  drawTopologyNode(canvas, 9, "NAS", color.blue, source_active);
+  canvas.drawLine(53, 50, 62, 50, source_active ? color.cyan : color.idle);
+  canvas.fillTriangle(64, 50, 59, 47, 59, 53, source_active ? color.cyan : color.idle);
+  drawTopologyNode(canvas, 64, "WIFI", color.cyan, wifi_active);
+  canvas.drawLine(108, 50, 117, 50, wifi_active ? color.lime : color.idle);
+  canvas.fillTriangle(119, 50, 114, 47, 114, 53, wifi_active ? color.lime : color.idle);
+  drawTopologyNode(canvas, 118, "LCD", color.lime, true);
+  drawBoundedLabel(canvas, "WAN DOWN", 8, 83, 54, 1, color.cyan);
+  drawValueUnit(canvas, floatValue(state.down_mbps), "Mb/s", 68, 78, 91, 94, 26,
+                readingColor(color.text), color.dim);
+  drawBoundedLabel(canvas, "WAN UP", 8, 111, 54, 1, color.blue);
+  drawValueUnit(canvas, floatValue(state.up_mbps), "Mb/s", 68, 106, 119, 94, 26,
+                readingColor(color.text), color.dim);
+  drawPanel(canvas, 8, 139, 154, 61);
+  drawBoundedLabel(canvas, "API RTT " + String(HISTORY_WINDOW_SECONDS) + "S  " +
+                        intValue(state.api_rtt_ms) + "ms", 15, 146, 140, 1, color.dim);
   drawHistoryCurve(canvas, 15, 159, 140, 34, latency_history, color.orange, 2, false, 0.0f, 1500.0f);
   String lan_value = "-- LINK";
   if (state.lan_speed_mbps >= 1000) lan_value = String(state.lan_speed_mbps / 1000) + "G LINK";
   else if (state.lan_speed_mbps > 0) lan_value = String(state.lan_speed_mbps) + "M LINK";
   else if (state.online) lan_value = "LINK UP";
   drawMetricTile(canvas, 8, 211, 73, "LAN", lan_value);
-  const String wifi_value = state.online ? String(WiFi.RSSI()) + "dBm" : "--dBm";
+  const String wifi_value = wifi_active ? String(WiFi.RSSI()) + "dBm" : "--dBm";
   drawMetricTile(canvas, 89, 211, 73, "WIFI", wifi_value);
   drawEdgePair(canvas, FNOS_HOST[0] ? String(FNOS_HOST) : String("192.168.9.23"),
-               state.online ? "DATA LIVE" : "NO DATA", 266, color.dim,
-               state.online ? color.green : color.red);
+               trustLabel(), 266, color.dim, trustColor());
   drawFooter(canvas, Page::Network);
 }
 
 void drawStorage(TFT_eSprite &canvas) {
   const int used = storagePercent();
-  drawHeader(canvas, "STORAGE", state.online ? "ONLINE" : "OFFLINE",
-             state.online ? color.green : color.red);
+  drawHeader(canvas, "STORAGE", trustLabel(), trustColor());
+  drawPageAccent(canvas, color.amber);
   canvas.drawArc(69, 76, 46, 36, 30, 330, color.guide, color.background, true);
   if (used > 0) canvas.drawArc(69, 76, 46, 36, 30, 30 + used * 3, color.amber, color.background, true);
   drawLabel(canvas, percentValue(used), 69, 73, 4, color.text, MC_DATUM);
@@ -451,18 +624,19 @@ void drawStorage(TFT_eSprite &canvas) {
                             ? max(0.0f, state.total_tb - state.used_tb) : NAN;
   drawFitNumber(canvas, isfinite(free_tb) ? String(free_tb, 1) + "T" : "--.-T",
                 122, 99, 40, 18, color.text);
-  canvas.fillRoundRect(8, 133, 154, 70, 7, color.panel);
+  drawPanel(canvas, 8, 133, 154, 70);
   drawLabel(canvas, "CAPACITY", 15, 140, 1, color.dim);
   drawLabel(canvas, "POOL", 15, 158, 1, color.text);
   canvas.fillRoundRect(49, 159, 104, 7, 3, color.guide);
   if (used >= 0) canvas.fillRoundRect(49, 159, max(1, used * 104 / 100), 7, 3, color.amber);
-  drawLabel(canvas, "USED " + (isfinite(state.used_tb) ? String(state.used_tb, 1) + "T" : String("--.-T")),
-            15, 181, 1, color.text);
-  drawLabel(canvas, "FREE " + (isfinite(free_tb) ? String(free_tb, 1) + "T" : String("--.-T")),
-            153, 181, 1, color.dim, TR_DATUM);
+  drawBoundedPair(canvas,
+                  "USED " + (isfinite(state.used_tb) ? String(state.used_tb, 1) + "T" : String("--.-T")),
+                  "FREE " + (isfinite(free_tb) ? String(free_tb, 1) + "T" : String("--.-T")),
+                  15, 181, 138, 8, color.text, color.dim);
+  canvas.drawFastVLine(84, 174, 21, color.guide);
   drawLabel(canvas, "DISK TEMP", 8, 218, 1, color.orange);
   drawTemperature(canvas, state.disk_temp_c, 162, 210, 2,
-                  state.disk_temp_c >= 0 ? color.text : color.dim, TR_DATUM);
+                  state.disk_temp_c >= 0 ? color.text : color.dim, TR_DATUM, 54);
   drawHistoryCurve(canvas, 8, 237, 154, 31, temp_history, color.orange, 2, false, 20.0f, 70.0f);
   const String raid_value = state.raid_status.length() ? "RAID " + state.raid_status : "RAID UNKNOWN";
   const uint16_t raid_color = state.raid_status == "HEALTHY" ? color.green
@@ -474,31 +648,33 @@ void drawStorage(TFT_eSprite &canvas) {
 }
 
 void drawSystem(TFT_eSprite &canvas) {
-  drawHeader(canvas, "SYSTEM", state.online ? "STABLE" : "OFFLINE",
-             state.online ? color.green : color.red);
-  canvas.fillRoundRect(8, 31, 73, 74, 8, color.panel);
+  drawHeader(canvas, "SYSTEM", trustLabel(), trustColor());
+  drawPageAccent(canvas, color.blue);
+  drawPanel(canvas, 8, 31, 73, 74, 8);
   drawLabel(canvas, "CPU", 16, 39, 1, color.blue);
   drawFitNumber(canvas, percentValue(state.cpu), 16, 53, 61, 32, color.text);
   drawTemperature(canvas, state.cpu_temp_c, 16, 90, 1,
                   state.cpu_temp_c < 0 ? color.dim
-                  : state.cpu_temp_c < 75 ? color.green : color.orange);
-  canvas.fillRoundRect(89, 31, 73, 74, 8, color.panel);
+                  : state.cpu_temp_c < 75 ? color.green : color.orange,
+                  TL_DATUM, 57);
+  drawPanel(canvas, 89, 31, 73, 74, 8);
   drawLabel(canvas, "MEMORY", 97, 39, 1, color.cyan);
   drawFitNumber(canvas, percentValue(state.memory), 97, 53, 61, 32, color.text);
-  drawLabel(canvas, isfinite(state.memory_used_gb) ? String(state.memory_used_gb, 1) + "G" : "--.-G",
-            97, 90, 1, color.dim);
-  canvas.fillRoundRect(8, 116, 154, 63, 7, color.panel);
+  drawBoundedLabel(canvas,
+                   isfinite(state.memory_used_gb) ? String(state.memory_used_gb, 1) + "G" : "--.-G",
+                   97, 90, 57, 1, color.dim);
+  drawPanel(canvas, 8, 116, 154, 63);
   drawLabel(canvas, "CPU LOAD " + String(HISTORY_WINDOW_SECONDS) + "S", 15, 123, 1, color.dim);
   drawHistoryCurve(canvas, 15, 137, 140, 35, cpu_history, color.blue, 2, false, 0.0f, 100.0f);
   drawLabel(canvas, "GPU", 8, 194, 1, color.dim);
   drawLabel(canvas, percentValue(state.gpu), 162, 189, 2, color.text, TR_DATUM);
-  canvas.fillRoundRect(8, 218, 154, 35, 7, color.panel_alt);
+  drawPanel(canvas, 8, 218, 154, 35, 7, color.panel_alt);
   const bool storage_healthy = state.raid_status == "HEALTHY";
   canvas.fillCircle(18, 235, 4, storage_healthy ? color.green : color.orange);
-  drawLabel(canvas, state.raid_status.length() ? state.raid_status : "NO DATA", 28, 228, 1,
-            storage_healthy ? color.text : color.orange);
+  drawBoundedLabel(canvas, state.raid_status.length() ? state.raid_status : "NO DATA",
+                   28, 228, 82, 1, storage_healthy ? color.text : color.orange);
   drawTemperature(canvas, state.disk_temp_c, 153, 228, 1,
-                  state.disk_temp_c >= 0 ? color.text : color.dim, TR_DATUM);
+                  state.disk_temp_c >= 0 ? color.text : color.dim, TR_DATUM, 35);
   drawEdgePair(canvas, "UPTIME " + uptimeValue(),
                isfinite(state.load_1m) ? "LOAD " + String(state.load_1m, 2) : "LOAD --",
                268, color.dim, color.dim);
@@ -506,25 +682,24 @@ void drawSystem(TFT_eSprite &canvas) {
 }
 
 void drawNormal(TFT_eSprite &canvas) {
-  drawHeader(canvas, "STATE", state.online ? "NORMAL" : "OFFLINE",
-             state.online ? color.green : color.red);
-  canvas.fillRoundRect(8, 29, 154, 32, 8, dimColor(color.green, 18));
-  canvas.fillCircle(20, 45, 4, color.green);
-  drawLabel(canvas, state.online ? "ONLINE HEALTHY" : "LINK LOST",
-            30, 38, 2, state.online ? color.green : color.red);
-  drawLabel(canvas, "DOWNLOAD", 8, 74, 1, color.cyan);
-  drawFitNumber(canvas, floatValue(state.down_mbps), 8, 84, 138, 48, color.text);
-  drawLabel(canvas, "Mb/s", 162, 111, 1, color.dim, TR_DATUM);
-  canvas.fillRoundRect(8, 133, 154, 63, 7, color.panel);
-  drawLabel(canvas, "NETWORK " + String(HISTORY_WINDOW_SECONDS) + "S", 15, 140, 1, color.dim);
-  drawHistoryCurve(canvas, 15, 153, 140, 37, down_history, color.cyan, 2, true);
-  drawMetricTile(canvas, 8, 207, 46, "API RT",
+  const DataTrust trust = dataTrust();
+  const bool live = trust == DataTrust::Live;
+  const String state_text = live ? "ONLINE HEALTHY"
+                            : trust == DataTrust::Stale ? "DATA STALE"
+                            : trust == DataTrust::Warming ? "SYNCING" : "LINK LOST";
+  drawHeader(canvas, "STATE", trustLabel(), trustColor());
+  drawPageAccent(canvas, color.green);
+  drawStateBand(canvas, state_text, trustColor(), live ? 2 : 1);
+  drawHeroBlock(canvas, "DOWNLOAD", floatValue(state.down_mbps), color.cyan);
+  drawTrendPanel(canvas, "NETWORK " + String(HISTORY_WINDOW_SECONDS) + "S",
+                 down_history, color.cyan, true);
+  drawMetricTile(canvas, 8, ui::tiles_y, 46, "API RT",
                  state.api_rtt_ms >= 0 ? String(state.api_rtt_ms) + "ms" : "--ms", color.orange);
-  drawMetricTile(canvas, 62, 207, 46, "CPU", percentValue(state.cpu));
-  drawMetricTile(canvas, 116, 207, 46, "DISK", percentValue(storagePercent()), color.amber);
-  drawEdgePair(canvas, state.online ? "SERVICES READY" : "SERVICES UNKNOWN",
+  drawMetricTile(canvas, 62, ui::tiles_y, 46, "CPU", percentValue(state.cpu));
+  drawMetricTile(canvas, 116, ui::tiles_y, 46, "DISK", percentValue(storagePercent()), color.amber);
+  drawEdgePair(canvas, live ? "SERVICES READY" : "SERVICES UNKNOWN",
                state.api_rtt_ms >= 0 ? "API " + String(state.api_rtt_ms) + "ms" : "API NO DATA",
-               266, state.online ? color.green : color.red,
+               ui::summary_y, trustColor(),
                state.api_rtt_ms >= 0 ? color.green : color.dim);
   drawFooter(canvas, Page::Normal);
 }
@@ -535,58 +710,60 @@ void drawHighLoad(TFT_eSprite &canvas) {
   const int cpu = state.cpu;
   const int api_rtt = state.api_rtt_ms;
   const int disk = storagePercent();
-  const bool high = cpu >= 80 || disk >= 85 || (isfinite(down) && down >= 800.0f);
-  drawHeader(canvas, "STATE", high ? "HIGH LOAD" : "LOAD WATCH",
-             high ? color.amber : color.green);
-  canvas.fillRoundRect(8, 29, 154, 32, 8, dimColor(high ? color.amber : color.green, 16));
-  canvas.fillCircle(20, 45, 4, high ? color.amber : color.green);
-  drawLabel(canvas, high ? "HIGH LOAD" : "LOAD NORMAL", 30, 38, 2, high ? color.amber : color.green);
-  drawLabel(canvas, "DOWNLOAD", 8, 74, 1, color.cyan);
-  drawFitNumber(canvas, floatValue(down), 8, 84, 138, 48, color.text);
-  drawLabel(canvas, "Mb/s", 162, 111, 1, color.dim, TR_DATUM);
-  canvas.fillRoundRect(8, 133, 154, 63, 7, color.panel);
-  drawLabel(canvas, String(high ? "TRAFFIC PEAK " : "TRAFFIC WATCH ") +
-                        HISTORY_WINDOW_SECONDS + "S", 15, 140, 1,
-            high ? color.amber : color.dim);
-  drawHistoryCurve(canvas, 15, 153, 140, 37, down_history, color.cyan, 2, true);
-  drawMetricTile(canvas, 8, 207, 46, "API RT",
+  const bool live = dataTrust() == DataTrust::Live;
+  const bool high = live && (cpu >= 80 || disk >= 85 || (isfinite(down) && down >= 800.0f));
+  drawHeader(canvas, "STATE", live ? (high ? "HIGH LOAD" : "LOAD WATCH") : trustLabel(),
+             live ? (high ? color.amber : color.green) : trustColor());
+  const uint16_t load_color = live ? (high ? color.amber : color.green) : trustColor();
+  drawPageAccent(canvas, load_color);
+  drawStateBand(canvas, live ? (high ? "HIGH LOAD" : "LOAD NORMAL") : trustLabel(),
+                load_color, live ? 2 : 1);
+  drawHeroBlock(canvas, "DOWNLOAD", floatValue(down), color.cyan);
+  drawTrendPanel(canvas, String(high ? "TRAFFIC PEAK " : "TRAFFIC WATCH ") +
+                           HISTORY_WINDOW_SECONDS + "S",
+                 down_history, color.cyan, true);
+  drawMetricTile(canvas, 8, ui::tiles_y, 46, "API RT",
                  api_rtt >= 0 ? String(api_rtt) + "ms" : "--ms", color.orange);
-  drawMetricTile(canvas, 62, 207, 46, "CPU", percentValue(cpu), high ? color.amber : color.text);
-  drawMetricTile(canvas, 116, 207, 46, "DISK", percentValue(disk), high ? color.amber : color.text);
-  drawEdgePair(canvas, high ? "THROTTLE WATCH" : "CAPACITY READY",
-               floatValue(up) + " UP", 266, high ? color.amber : color.green, color.orange);
+  drawMetricTile(canvas, 62, ui::tiles_y, 46, "CPU", percentValue(cpu), high ? color.amber : color.text);
+  drawMetricTile(canvas, 116, ui::tiles_y, 46, "DISK", percentValue(disk), high ? color.amber : color.text);
+  drawEdgePair(canvas, live ? (high ? "THROTTLE WATCH" : "CAPACITY READY") : trustLabel(),
+               floatValue(up) + " UP", ui::summary_y,
+               live ? (high ? color.amber : color.green) : trustColor(), color.blue);
   drawFooter(canvas, Page::HighLoad);
 }
 
 void drawTimeout(TFT_eSprite &canvas) {
-  const bool timeout = !state.online;
-  drawHeader(canvas, "STATE", timeout ? "TIMEOUT" : "ONLINE",
-             timeout ? color.red : color.green);
-  canvas.fillRoundRect(8, 29, 154, 32, 8, dimColor(timeout ? color.red : color.green, 16));
-  canvas.fillCircle(20, 45, 4, timeout ? color.red : color.green);
-  drawLabel(canvas, timeout ? "CONNECTION TIMEOUT" : "LINK READY", 30, 38,
-            timeout ? 1 : 2, timeout ? color.red : color.green);
-  drawLabel(canvas, "DOWNLOAD", 8, 74, 1, timeout ? color.idle : color.cyan);
-  drawFitNumber(canvas, timeout ? "--.-" : floatValue(state.down_mbps), 8, 84, 138, 48,
-                timeout ? color.dim : color.text);
-  drawLabel(canvas, "Mb/s", 162, 111, 1, color.idle, TR_DATUM);
-  canvas.fillRoundRect(8, 133, 154, 63, 7, color.panel);
-  drawLabel(canvas, timeout ? String("NO REALTIME DATA")
-                            : "NETWORK " + String(HISTORY_WINDOW_SECONDS) + "S", 15, 140, 1,
-            timeout ? color.red : color.dim);
-  if (timeout) {
-    drawSmoothCurve(canvas, 15, 153, 140, 37, TIMEOUT_CURVE, HISTORY_COUNT,
+  const DataTrust trust = dataTrust();
+  const bool unavailable = trust == DataTrust::Warming || trust == DataTrust::Offline;
+  const String state_text = trust == DataTrust::Warming ? "WAITING FOR DATA"
+                            : trust == DataTrust::Stale ? "CACHED VALUES"
+                            : trust == DataTrust::Offline ? "CONNECTION LOST" : "LINK READY";
+  drawHeader(canvas, "STATE", trustLabel(), trustColor());
+  drawPageAccent(canvas, trustColor());
+  drawStateBand(canvas, state_text, trustColor(),
+                trust == DataTrust::Live ? 2 : 1);
+  drawHeroBlock(canvas, "DOWNLOAD",
+                unavailable ? "--.-" : floatValue(state.down_mbps),
+                unavailable ? color.idle : color.cyan, color.idle);
+  drawPanel(canvas, ui::edge, ui::trend_y, ui::content_width, ui::trend_h);
+  drawBoundedLabel(canvas, unavailable ? String("NO REALTIME DATA")
+                                       : "NETWORK " + String(HISTORY_WINDOW_SECONDS) + "S",
+                   15, ui::trend_y + 7, 140, 1,
+                   unavailable ? trustColor() : color.dim);
+  if (unavailable) {
+    drawSmoothCurve(canvas, 15, ui::trend_y + 20, 140, 36, TIMEOUT_CURVE, HISTORY_COUNT,
                     color.idle, 2, true, true);
   } else {
-    drawHistoryCurve(canvas, 15, 153, 140, 37, down_history, color.cyan, 2, true);
+    drawHistoryCurve(canvas, 15, ui::trend_y + 20, 140, 36, down_history,
+                     color.cyan, 2, true);
   }
-  drawMetricTile(canvas, 8, 207, 73, "LAST GOOD",
+  drawMetricTile(canvas, 8, ui::tiles_y, 73, "LAST GOOD",
                  state.last_good_ms ? String((millis() - state.last_good_ms) / 1000) + "s ago" : "--");
-  drawMetricTile(canvas, 89, 207, 73, "NEXT RETRY", timeout ? "1s" : "READY",
-                 timeout ? color.red : color.green);
-  drawEdgePair(canvas, timeout ? "API TIMEOUT" : "API CONNECTED",
-               timeout ? "NO DATA" : "VALUES LIVE", 266,
-               timeout ? color.red : color.green, color.dim);
+  drawMetricTile(canvas, 89, ui::tiles_y, 73, "NEXT RETRY", unavailable ? "1s" : "READY",
+                 unavailable ? trustColor() : color.green);
+  drawEdgePair(canvas, unavailable ? "API UNAVAILABLE" : "API CONNECTED",
+               trustLabel(), ui::summary_y,
+               unavailable ? trustColor() : color.green, trustColor());
   drawFooter(canvas, Page::Timeout);
 }
 
@@ -601,6 +778,7 @@ void renderPage(TFT_eSprite &canvas, Page page) {
     case Page::HighLoad: drawHighLoad(canvas); break;
     case Page::Timeout: drawTimeout(canvas); break;
   }
+  canvas.drawRect(0, 0, SCREEN_W, SCREEN_H, color.guide);
 }
 
 void invalidateFrames() {
@@ -658,6 +836,20 @@ void selectRelativePage(int direction) {
   announcePage();
 }
 
+// Advance a critically damped spring from its current presentation value.
+// The closed-form step stays stable when the loop is briefly late, while
+// preserving velocity so a new page target can be chosen mid-transition.
+void advancePageSpring(float delta) {
+  const float displacement = page_position - page_target;
+  const float omega = SPRING_OMEGA;
+  const float velocity_term = page_velocity + omega * displacement;
+  const float decay = expf(-omega * delta);
+  const float next_displacement =
+      (displacement + velocity_term * delta) * decay;
+  page_velocity = (page_velocity - omega * velocity_term * delta) * decay;
+  page_position = page_target + next_displacement;
+}
+
 bool updateButton(DebouncedButton &button, int direction) {
   const bool reading = digitalRead(button.pin);
   const uint32_t now = millis();
@@ -685,11 +877,7 @@ void updatePageAnimation() {
   float delta = last_frame_us == 0 ? 1.0f / 60.0f : (now_us - last_frame_us) / 1000000.0f;
   last_frame_us = now_us;
   delta = constrain(delta, .001f, 1.0f / 30.0f);
-  const float displacement = page_position - page_target;
-  const float acceleration = -2.0f * SPRING_OMEGA * page_velocity -
-                             SPRING_OMEGA * SPRING_OMEGA * displacement;
-  page_velocity += acceleration * delta;
-  page_position += page_velocity * delta;
+  advancePageSpring(delta);
   if (fabsf(page_position - page_target) < .0005f && fabsf(page_velocity) < .002f) {
     page_position = page_target;
     page_velocity = 0.0f;
@@ -827,9 +1015,10 @@ bool fetchState(NasState &target) {
   if (WiFi.status() != WL_CONNECTED) {
     target.online = false;
     target.error = "Wi-Fi unavailable";
-    clearRealtimeValues(target);
+    target.consecutive_failures = min<int>(255, target.consecutive_failures + 1);
     return false;
   }
+  NasState candidate = target;
   HTTPClient http;
   http.setTimeout(3000);
   http.begin(String("http://") + FNOS_HOST + FNOS_API_PATH);
@@ -839,22 +1028,24 @@ bool fetchState(NasState &target) {
   if (code != HTTP_CODE_OK) {
     target.online = false;
     target.error = code > 0 ? "HTTP " + String(code) : "request timeout";
-    clearRealtimeValues(target);
+    target.consecutive_failures = min<int>(255, target.consecutive_failures + 1);
     http.end();
     return false;
   }
-  if (!parsePrometheusMetrics(http, target)) {
+  if (!parsePrometheusMetrics(http, candidate)) {
     http.end();
     target.online = false;
     target.error = "metrics empty";
-    clearRealtimeValues(target);
+    target.consecutive_failures = min<int>(255, target.consecutive_failures + 1);
     return false;
   }
-  target.api_rtt_ms = min<int>(9999, static_cast<int>(millis() - request_started_ms));
+  candidate.api_rtt_ms = min<int>(9999, static_cast<int>(millis() - request_started_ms));
   http.end();
-  target.online = true;
-  target.error = "";
-  target.last_good_ms = max<uint32_t>(1, millis());
+  candidate.online = true;
+  candidate.consecutive_failures = 0;
+  candidate.error = "";
+  candidate.last_good_ms = max<uint32_t>(1, millis());
+  target = candidate;
   return true;
 }
 
@@ -892,11 +1083,11 @@ void consumeTelemetry() {
 
 void announceTelemetry() {
   Serial.printf(
-      "FNOS_STATE online=%s cpu=%d memory=%d gpu=%d api_rtt=%dms "
-      "storage=%d disk_temp=%dC lan=%dM down=%.2f up=%.2f error=%s\n",
-      state.online ? "yes" : "no", state.cpu, state.memory, state.gpu,
+      "FNOS_STATE ui=%s online=%s cpu=%d memory=%d gpu=%d api_rtt=%dms "
+      "storage=%d disk_temp=%dC lan=%dM down=%.2f up=%.2f fetch=%s\n",
+      UI_BUILD_ID, state.online ? "yes" : "no", state.cpu, state.memory, state.gpu,
       state.api_rtt_ms, storagePercent(), state.disk_temp_c, state.lan_speed_mbps,
-      state.down_mbps, state.up_mbps, state.error.length() ? state.error.c_str() : "none");
+      state.down_mbps, state.up_mbps, state.error.length() ? state.error.c_str() : "ok");
 }
 
 void initFrames() {
@@ -941,6 +1132,7 @@ void fadeInBacklight() {
 void setup() {
   initBacklightOff();
   Serial.begin(115200);
+  Serial.printf("UI_BUILD %s pages=%u adaptive=yes\n", UI_BUILD_ID, PAGE_COUNT);
   pinMode(BUTTON_1, INPUT_PULLUP);
   pinMode(BUTTON_2, INPUT_PULLUP);
   tft.init();
@@ -954,7 +1146,6 @@ void setup() {
   tft.drawString("building 7 views...", SCREEN_W / 2, 172, 1);
   WiFi.mode(WIFI_STA);
   WiFi.begin(FNOS_WIFI_SSID, FNOS_WIFI_PASSWORD);
-  fetchState(state);
   announceTelemetry();
   seedHistories();
   initFrames();
